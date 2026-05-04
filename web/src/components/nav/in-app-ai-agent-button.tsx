@@ -1,28 +1,31 @@
-import { LifeBuoy } from "lucide-react";
-import { SidebarMenuButton, useSidebar } from "@/src/components/ui/sidebar";
-import { useSupportDrawer } from "@/src/features/support-chat/SupportDrawerProvider";
-import { useInAppAiAgent } from "@/src/features/in-app-agent/components/InAppAiAgentProvider";
+import { Bot } from "lucide-react";
 
-export const SupportButton = () => {
+import { SidebarMenuButton, useSidebar } from "@/src/components/ui/sidebar";
+import { useInAppAiAgent } from "@/src/features/in-app-agent/components/InAppAiAgentProvider";
+import { useSupportDrawer } from "@/src/features/support-chat/SupportDrawerProvider";
+
+export const InAppAiAgentButton = () => {
+  const { setOpen } = useInAppAiAgent();
   const { setOpen: setSupportDrawerOpen } = useSupportDrawer();
-  const { setOpen: setAiAgentOpen } = useInAppAiAgent();
   const { isMobile, setOpenMobile: setOpenMobileSidebar } = useSidebar();
+
+  const toggleInAppAiAgent = () => {
+    setSupportDrawerOpen(false);
+    setOpen((currentOpen) => !currentOpen);
+  };
 
   return (
     <SidebarMenuButton
+      isActive={false}
       onClick={() => {
         if (isMobile) {
           setOpenMobileSidebar(false);
         }
-        setTimeout(() => {
-          // push to next tick to avoid flickering when hiding sidebar on mobile
-          setAiAgentOpen(false);
-          setSupportDrawerOpen(true);
-        }, 1);
+        toggleInAppAiAgent();
       }}
     >
-      <LifeBuoy className="h-4 w-4" />
-      Support
+      <Bot className="h-4 w-4" />
+      AI-Agent
     </SidebarMenuButton>
   );
 };

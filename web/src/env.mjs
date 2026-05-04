@@ -399,6 +399,7 @@ export const env = createEnv({
     SLACK_STATE_SECRET: z.string().optional(),
 
     // AWS Bedrock for langfuse native AI feature such as natural language filters
+    LANGFUSE_AWS_BEDROCK_REGION: z.string().optional(),
     LANGFUSE_AWS_BEDROCK_MODEL: z.string().optional(),
 
     // Tracing for Langfuse AI Features
@@ -821,6 +822,7 @@ export const env = createEnv({
     SLACK_STATE_SECRET: process.env.SLACK_STATE_SECRET,
 
     // AWS Bedrock for langfuse native AI feature such as natural language filters
+    LANGFUSE_AWS_BEDROCK_REGION: process.env.LANGFUSE_AWS_BEDROCK_REGION,
     LANGFUSE_AWS_BEDROCK_MODEL: process.env.LANGFUSE_AWS_BEDROCK_MODEL,
 
     // Langfuse Tracing AI Features
