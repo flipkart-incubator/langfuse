@@ -161,6 +161,14 @@ export const DatasetStep: React.FC<DatasetStepProps> = ({
                             <li key={variable}>{variable}</li>
                           ))}
                         </ul>
+                        {expectedColumns.usesMetadata && (
+                          <>
+                            <p className="text-sm font-medium">Metadata:</p>
+                            <p className="text-muted-foreground text-sm">
+                              This prompt accesses dataset item metadata.
+                            </p>
+                          </>
+                        )}
                         <p className="text-sm font-medium">Expected output:</p>
                         <ul className="list-inside list-disc text-sm">
                           <li>
@@ -168,6 +176,17 @@ export const DatasetStep: React.FC<DatasetStepProps> = ({
                             {expectedColumns.outputVariableType})
                           </li>
                         </ul>
+                        <p className="text-muted-foreground mt-2 border-t pt-2 text-xs">
+                          Tip: Use Jinja2 syntax for conditionals (e.g.,{" "}
+                          <code className="text-xs">
+                            {"{% if metadata.key %}...{% endif %}"}
+                          </code>
+                          ). Access metadata via{" "}
+                          <code className="text-xs">
+                            {"{{ metadata.key }}"}
+                          </code>
+                          .
+                        </p>
                       </div>
                     </div>
                   </PopoverContent>

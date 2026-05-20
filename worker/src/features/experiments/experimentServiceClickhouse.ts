@@ -2,6 +2,7 @@ import {
   asRecord,
   convertEventRecordToObservationForEval,
   DatasetItemDomain,
+  isPresent,
   Prisma,
 } from "@langfuse/shared";
 import {
@@ -170,6 +171,8 @@ async function processLLMCall(
       datasetItem.input,
       config.allVariables,
       config.placeholderNames,
+      asRecord(datasetItem.metadata) ?? {},
+      config.templateFormat,
     );
   } catch (error) {
     logger.error(
@@ -246,20 +249,30 @@ async function getItemsToProcess(
     includeIO: true,
   });
 
+  // Filter out "metadata" from variables used for input validation, since
+  // metadata is always injected from the dataset item's metadata field.
+  const inputOnlyVariables = config.allVariables.filter(
+    (v) => v !== "metadata",
+  );
+
   // Filter and validate dataset items
   const validatedDatasetItems = datasetItems
-    .filter(({ input }) => validateDatasetItem(input, config.allVariables))
+    .filter(({ input }) => {
+      // If the only variables are metadata-related, all items with input are valid
+      if (inputOnlyVariables.length === 0) return isPresent(input);
+      return validateDatasetItem(input, inputOnlyVariables);
+    })
     .map((datasetItem) => {
       // Normalize string inputs to object format for single-variable prompts
       const normalizedInput = normalizeDatasetItemInput(
         datasetItem.input,
-        config.allVariables,
+        inputOnlyVariables,
       );
 
       return {
         ...datasetItem,
         status: datasetItem.status ?? "ACTIVE",
-        input: parseDatasetItemInput(normalizedInput, config.allVariables),
+        input: parseDatasetItemInput(normalizedInput, inputOnlyVariables),
       };
     });
 
