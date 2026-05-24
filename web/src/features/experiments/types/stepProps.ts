@@ -73,6 +73,7 @@ export type DatasetState = {
     inputVariables: string[];
     outputVariableType: PromptType;
     outputVariableName: string;
+    usesMetadata?: boolean;
   };
 };
 

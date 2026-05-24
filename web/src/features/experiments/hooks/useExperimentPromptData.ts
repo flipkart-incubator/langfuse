@@ -2,7 +2,7 @@ import { useMemo } from "react";
 import { api } from "@/src/utils/api";
 import { type UseFormReturn } from "react-hook-form";
 import {
-  extractVariables,
+  extractTemplateVariablesLite,
   PromptType,
   extractPlaceholderNames,
   type PromptMessage,
@@ -34,7 +34,7 @@ export function useExperimentPromptData({
     const prompt = promptMeta.data?.find((p) => p.id === promptId);
     if (!prompt) return [];
 
-    const extractedVariables = extractVariables(
+    const extractedVariables = extractTemplateVariablesLite(
       prompt.type === PromptType.Text
         ? (prompt?.prompt?.toString() ?? "")
         : JSON.stringify(prompt?.prompt),
@@ -50,6 +50,8 @@ export function useExperimentPromptData({
 
     return [...extractedVariables, ...placeholderNames];
   }, [promptId, promptMeta.data]);
+
+  const usesMetadata = expectedColumns.includes("metadata");
 
   const promptsByName = useMemo(
     () =>
@@ -76,6 +78,7 @@ export function useExperimentPromptData({
 
   return {
     expectedColumns,
+    usesMetadata,
     promptsByName,
     promptId,
     selectedPromptModelConfig,
