@@ -9,7 +9,7 @@ import { PromptVersionDiffDialog } from "@/src/features/prompts/components/Promp
 type OxfordViewVersion =
   RouterOutputs["oxfordViews"]["allVersions"]["promptVersions"][number];
 
-const OxfordViewHistoryNode = (props: {
+const OxfordViewHistoryItem = (props: {
   index: number;
   view: OxfordViewVersion;
   currentView?: OxfordViewVersion;
@@ -147,7 +147,7 @@ export const OxfordViewHistoryNode = (props: {
   return (
     <Timeline>
       {props.views.map((view, index) => (
-        <OxfordViewHistoryNode
+        <OxfordViewHistoryItem
           key={view.id}
           index={index}
           view={view}
