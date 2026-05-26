@@ -16,11 +16,7 @@ import {
 import { useHasProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
 import useProjectIdFromURL from "@/src/hooks/useProjectIdFromURL";
 import { api } from "@/src/utils/api";
-import {
-  PRODUCTION_LABEL,
-  PromptLabelSchema,
-  type Prompt,
-} from "@langfuse/shared";
+import { PRODUCTION_LABEL, PromptLabelSchema } from "@langfuse/shared";
 import { LabelCommandItem } from "./LabelCommandItem";
 import { usePostHogClientCapture } from "@/src/features/posthog-analytics/usePostHogClientCapture";
 import { isReservedPromptLabel } from "@/src/features/prompts/utils";
@@ -37,7 +33,7 @@ export function SetOxfordViewVersionLabels({
   maxVisibleLabels = 8,
 }: {
   promptLabels: string[];
-  prompt: Prompt;
+  prompt: { id: string; labels: string[] };
   isOpen: boolean;
   setIsOpen: (isOpen: boolean) => void;
   title?: ReactNode;
