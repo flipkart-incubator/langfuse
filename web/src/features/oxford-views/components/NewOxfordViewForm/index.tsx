@@ -420,7 +420,7 @@ export const NewOxfordViewForm: React.FC<NewOxfordViewFormProps> = (props) => {
         {initialPrompt ? (
           <div className="flex flex-col gap-2">
             <ReviewPromptDialog
-              initialPrompt={{ ...initialPrompt, isActive: null }}
+              initialPrompt={initialPrompt as any}
               getNewPromptValues={form.getValues}
               isLoading={createMutation.isPending}
               onConfirm={form.handleSubmit(onSubmit)}
