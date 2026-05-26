@@ -26,7 +26,8 @@ import {
   postgresSearchCondition,
 } from "@langfuse/shared/src/server";
 import { v4 as uuidv4 } from "uuid";
-import { jsonSchema, PromptContentSchema } from "@langfuse/shared/src/server";
+import { PromptContentSchema } from "@langfuse/shared/src/server";
+import { jsonSchema } from "@langfuse/shared";
 
 // ---- helpers ----
 
