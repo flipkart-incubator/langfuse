@@ -26,11 +26,20 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import {
   type CreatePromptTRPCType,
   PRODUCTION_LABEL,
-  type Prompt,
   PromptType,
   extractVariables,
   getIsCharOrUnderscore,
 } from "@langfuse/shared";
+
+type OxfordViewLike = {
+  id: string;
+  type: string;
+  name: string;
+  version: number;
+  prompt: unknown;
+  config: unknown;
+  labels: string[];
+};
 import { PromptChatMessages } from "@/src/features/prompts/components/NewPromptForm/PromptChatMessages";
 import { ReviewPromptDialog } from "@/src/features/prompts/components/NewPromptForm/ReviewPromptDialog";
 import {
@@ -50,7 +59,7 @@ import { useFormPersistence } from "@/src/hooks/useFormPersistence";
 import { usePromptNameValidation } from "@/src/features/prompts/hooks/usePromptNameValidation";
 
 type NewOxfordViewFormProps = {
-  initialPrompt?: Prompt | null;
+  initialPrompt?: OxfordViewLike | null;
   onFormSuccess?: () => void;
 };
 
@@ -411,7 +420,7 @@ export const NewOxfordViewForm: React.FC<NewOxfordViewFormProps> = (props) => {
         {initialPrompt ? (
           <div className="flex flex-col gap-2">
             <ReviewPromptDialog
-              initialPrompt={initialPrompt}
+              initialPrompt={{ ...initialPrompt, isActive: null }}
               getNewPromptValues={form.getValues}
               isLoading={createMutation.isPending}
               onConfirm={form.handleSubmit(onSubmit)}
