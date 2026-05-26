@@ -123,8 +123,8 @@ const OxfordViewHistoryItem = (props: {
                   <PromptVersionDiffDialog
                     isOpen={isDiffOpen}
                     setIsOpen={(open) => setIsDiffOpen(open)}
-                    leftPrompt={view}
-                    rightPrompt={props.currentView}
+                    leftPrompt={{ ...view, isActive: null }}
+                    rightPrompt={{ ...props.currentView, isActive: null }}
                   />
                 ) : null)}
             </div>
