@@ -237,7 +237,7 @@ export const oxfordViewRouter = createTRPCRouter({
       const filterCondition = tableColumnsToSqlFilterAndPrefix(
         input.filter ?? [],
         promptsTableCols,
-        "oxford_views",
+        "prompts",
       );
 
       const pathFilter = buildPathPrefixFilter(input.pathPrefix);
@@ -327,7 +327,7 @@ export const oxfordViewRouter = createTRPCRouter({
           ? tableColumnsToSqlFilterAndPrefix(
               input.filter,
               promptsTableCols,
-              "oxford_views",
+              "prompts",
             )
           : Prisma.empty;
 
