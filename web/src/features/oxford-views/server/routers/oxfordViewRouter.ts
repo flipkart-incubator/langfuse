@@ -520,7 +520,7 @@ export const oxfordViewRouter = createTRPCRouter({
           : v.labels,
         type: v.type,
         prompt: v.prompt as string[],
-        config: v.config ?? {},
+        config: (v.config ?? {}) as Prisma.InputJsonValue,
         tags: v.tags,
         projectId: input.projectId,
         createdBy: ctx.session.user.id,
@@ -609,7 +609,7 @@ export const oxfordViewRouter = createTRPCRouter({
         labels: string[];
         type: string;
         prompt: string[];
-        config: unknown;
+        config: Prisma.InputJsonValue;
         tags: string[];
         projectId: string;
         createdBy: string;
@@ -636,7 +636,7 @@ export const oxfordViewRouter = createTRPCRouter({
               : v.labels,
             type: v.type,
             prompt: v.prompt as string[],
-            config: v.config ?? {},
+            config: (v.config ?? {}) as Prisma.InputJsonValue,
             tags: v.tags,
             projectId,
             createdBy: ctx.session.user.id,
