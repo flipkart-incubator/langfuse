@@ -133,6 +133,15 @@ export const ROUTES: Route[] = [
     section: RouteSection.Main,
   },
   {
+    title: "Oxford Views",
+    pathname: "/project/[projectId]/oxford-views",
+    icon: FileJson,
+    projectRbacScopes: ["prompts:read"],
+    productModule: "prompt-management",
+    group: RouteGroup.PromptManagement,
+    section: RouteSection.Main,
+  },
+  {
     title: "Playground",
     pathname: "/project/[projectId]/playground",
     icon: TerminalIcon,
