@@ -11,13 +11,13 @@ import {
   LATEST_PROMPT_LABEL,
   optionalPaginationZod,
   paginationZod,
-  PromptType,
+  PromptNameSchema,
   StringNoHTMLNonEmpty,
   TracingSearchType,
   promptsTableCols,
   orderBy,
   singleFilter,
-  CreatePromptTRPCSchema,
+  COMMIT_MESSAGE_MAX_LENGTH,
 } from "@langfuse/shared";
 import {
   orderByToPrismaSql,
@@ -26,8 +26,19 @@ import {
   postgresSearchCondition,
 } from "@langfuse/shared/src/server";
 import { v4 as uuidv4 } from "uuid";
-import { PromptContentSchema } from "@langfuse/shared/src/server";
-import { jsonSchema } from "@langfuse/shared";
+
+// Input schema for creating / updating an Oxford View
+const CreateOxfordViewSchema = z.object({
+  projectId: z.string(),
+  name: PromptNameSchema,
+  prompt: z.array(z.string().min(1)),
+  labels: z.array(z.string()).default([]),
+  tags: z.array(z.string()).default([]),
+  commitMessage: z.string().trim().max(COMMIT_MESSAGE_MAX_LENGTH).optional(),
+  // type and config kept for schema compatibility but ignored / hardcoded
+  type: z.string().optional(),
+  config: z.unknown().optional(),
+});
 
 // ---- helpers ----
 
@@ -379,7 +390,7 @@ export const oxfordViewRouter = createTRPCRouter({
     }),
 
   create: protectedProjectProcedure
-    .input(CreatePromptTRPCSchema)
+    .input(CreateOxfordViewSchema)
     .mutation(async ({ input, ctx }) => {
       throwIfNoProjectAccess({
         session: ctx.session,
@@ -391,9 +402,7 @@ export const oxfordViewRouter = createTRPCRouter({
         projectId,
         name,
         prompt,
-        type = PromptType.Text,
         labels = [],
-        config,
         tags,
         commitMessage,
       } = input;
@@ -402,14 +411,6 @@ export const oxfordViewRouter = createTRPCRouter({
         where: { projectId, name },
         orderBy: [{ version: "desc" }],
       });
-
-      if (latestView && latestView.type !== type) {
-        throw new TRPCError({
-          code: "BAD_REQUEST",
-          message:
-            "Previous versions have different type. Create a new oxford view with a different name.",
-        });
-      }
 
       const finalLabels = [...new Set([...labels, LATEST_PROMPT_LABEL])];
       const finalTags = [...new Set(tags ?? latestView?.tags ?? [])];
@@ -441,11 +442,11 @@ export const oxfordViewRouter = createTRPCRouter({
             name,
             createdBy: ctx.session.user.id,
             labels: finalLabels,
-            type,
+            type: "text",
             tags: finalTags,
             version: newVersion,
             project: { connect: { id: projectId } },
-            config: jsonSchema.parse(config),
+            config: {},
             commitMessage,
           },
         }),
@@ -518,8 +519,8 @@ export const oxfordViewRouter = createTRPCRouter({
           ? [...new Set([LATEST_PROMPT_LABEL, ...v.labels])]
           : v.labels,
         type: v.type,
-        prompt: PromptContentSchema.parse(v.prompt),
-        config: jsonSchema.parse(v.config),
+        prompt: v.prompt as string[],
+        config: v.config,
         tags: v.tags,
         projectId: input.projectId,
         createdBy: ctx.session.user.id,
@@ -607,8 +608,8 @@ export const oxfordViewRouter = createTRPCRouter({
         version: number;
         labels: string[];
         type: string;
-        prompt: ReturnType<typeof PromptContentSchema.parse>;
-        config: ReturnType<typeof jsonSchema.parse>;
+        prompt: string[];
+        config: unknown;
         tags: string[];
         projectId: string;
         createdBy: string;
@@ -634,8 +635,8 @@ export const oxfordViewRouter = createTRPCRouter({
               ? [...new Set([LATEST_PROMPT_LABEL, ...v.labels])]
               : v.labels,
             type: v.type,
-            prompt: PromptContentSchema.parse(v.prompt),
-            config: jsonSchema.parse(v.config),
+            prompt: v.prompt as string[],
+            config: v.config,
             tags: v.tags,
             projectId,
             createdBy: ctx.session.user.id,
@@ -895,9 +896,7 @@ export const oxfordViewRouter = createTRPCRouter({
     }),
 
   allNames: protectedProjectProcedure
-    .input(
-      z.object({ projectId: z.string(), type: z.enum(PromptType).optional() }),
-    )
+    .input(z.object({ projectId: z.string(), type: z.string().optional() }))
     .query(async ({ input, ctx }) => {
       throwIfNoProjectAccess({
         session: ctx.session,
