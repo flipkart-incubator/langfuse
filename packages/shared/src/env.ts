@@ -427,6 +427,9 @@ const EnvSchema = z.object({
     .transform((s) =>
       s ? s.split(",").map((h) => h.toLowerCase().trim()) : [],
     ),
+
+  // Agent Debugger — webhook URL called by /api/custom/agent-resume
+  AGENT_RESUME_WEBHOOK_URL: z.url().optional(),
 });
 
 export type SharedEnv = z.infer<typeof EnvSchema>;

@@ -3,11 +3,42 @@ import {
   protectedGetTraceProcedure,
 } from "@/src/server/api/trpc";
 import { LangfuseNotFoundError, parseIO } from "@langfuse/shared";
-import { getObservationById } from "@langfuse/shared/src/server";
+import {
+  getObservationById,
+  getObservationsForTrace,
+} from "@langfuse/shared/src/server";
 import { z } from "zod";
 import { toDomainWithStringifiedMetadata } from "@/src/utils/clientSideDomainTypes";
 
 export const observationsRouter = createTRPCRouter({
+  /**
+   * Fetch all observations for a trace, including input/output payloads.
+   * Used by the AgentTranscript view.
+   */
+  allForTrace: protectedGetTraceProcedure
+    .input(
+      z.object({
+        traceId: z.string(),
+        projectId: z.string(),
+        timestamp: z.date().nullish(),
+      }),
+    )
+    .query(async ({ input }) => {
+      const observations = await getObservationsForTrace({
+        traceId: input.traceId,
+        projectId: input.projectId,
+        timestamp: input.timestamp ?? undefined,
+        includeIO: true,
+      });
+      return observations.map((obs) => ({
+        ...toDomainWithStringifiedMetadata(obs),
+        // Stringify input/output so JumpToPlaygroundButton can consume them
+        // directly — it expects string | null, same as the byId procedure.
+        input: parseIO(obs.input, "full") as string,
+        output: parseIO(obs.output, "full") as string,
+      }));
+    }),
+
   byId: protectedGetTraceProcedure
     .input(
       z.object({
