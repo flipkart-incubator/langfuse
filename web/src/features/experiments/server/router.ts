@@ -25,13 +25,13 @@ import {
   getScoresForTraces,
   traceException,
   getExperimentNamesFromEvents,
+  extractTemplateVariables,
 } from "@langfuse/shared/src/server";
 import {
   createTRPCRouter,
   protectedProjectProcedure,
 } from "@/src/server/api/trpc";
 import {
-  extractVariables,
   validateDatasetItem,
   UnauthorizedError,
   PromptType,
@@ -75,12 +75,28 @@ const ConfigResponse = z.discriminatedUnion("isValid", [
 const countValidDatasetItems = (
   datasetItems: Omit<DatasetItemDomain, "status">[],
   variables: string[],
+  usesMetadata: boolean = false,
 ): Record<string, number> => {
   const variableMap: Record<string, number> = {};
 
-  for (const { input } of datasetItems) {
-    // Step 1: Validate item
+  for (const item of datasetItems) {
+    const { input } = item;
+    const metadata = (item as DatasetItemDomain).metadata;
+
+    // When only metadata vars and no input vars, just count metadata
+    if (variables.length === 0 && usesMetadata) {
+      if (metadata !== null && metadata !== undefined) {
+        variableMap["metadata"] = (variableMap["metadata"] || 0) + 1;
+      }
+      continue;
+    }
+
+    // Step 1: Validate item input
     if (!isPresent(input) || !validateDatasetItem(input, variables)) {
+      // Even if input doesn't match, count metadata if used
+      if (usesMetadata && metadata !== null && metadata !== undefined) {
+        variableMap["metadata"] = (variableMap["metadata"] || 0) + 1;
+      }
       continue;
     }
 
@@ -89,16 +105,18 @@ const countValidDatasetItems = (
     // String with single variable - count that variable
     if (typeof input === "string" && variables.length === 1) {
       variableMap[variables[0]] = (variableMap[variables[0]] || 0) + 1;
-      continue;
-    }
-
-    // For object inputs, count each matching variable
-    if (typeof input === "object" && !Array.isArray(input)) {
+    } else if (typeof input === "object" && !Array.isArray(input)) {
+      // For object inputs, count each matching variable
       for (const variable of variables) {
         if (variable in input) {
           variableMap[variable] = (variableMap[variable] || 0) + 1;
         }
       }
+    }
+
+    // Count metadata matches
+    if (usesMetadata && metadata !== null && metadata !== undefined) {
+      variableMap["metadata"] = (variableMap["metadata"] || 0) + 1;
     }
   }
 
@@ -147,7 +165,7 @@ export const experimentsRouter = createTRPCRouter({
         };
       }
 
-      const extractedVariables = extractVariables(
+      const extractedVariables = extractTemplateVariables(
         resolvedPrompt?.type === PromptType.Text
           ? (resolvedPrompt.prompt?.toString() ?? "")
           : JSON.stringify(resolvedPrompt?.prompt),
@@ -163,6 +181,8 @@ export const experimentsRouter = createTRPCRouter({
       );
 
       const allVariables = [...extractedVariables, ...placeholderNames];
+      const usesMetadata = extractedVariables.includes("metadata");
+      const inputOnlyVariables = allVariables.filter((v) => v !== "metadata");
 
       if (!Boolean(allVariables.length)) {
         return {
@@ -187,9 +207,13 @@ export const experimentsRouter = createTRPCRouter({
         };
       }
 
-      const variablesMap = countValidDatasetItems(items, allVariables);
+      const variablesMap = countValidDatasetItems(
+        items,
+        inputOnlyVariables,
+        usesMetadata,
+      );
 
-      if (!Boolean(Object.keys(variablesMap).length)) {
+      if (!Boolean(Object.keys(variablesMap).length) && !usesMetadata) {
         return {
           isValid: false,
           message: "No dataset item contains any variables.",

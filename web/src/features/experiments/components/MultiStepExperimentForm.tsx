@@ -179,6 +179,7 @@ export const MultiStepExperimentForm = ({
     promptId: promptIdFromHook,
     promptsByName,
     expectedColumns,
+    usesMetadata,
     selectedPromptModelConfig,
   } = useExperimentPromptData({
     projectId,
@@ -405,6 +406,7 @@ export const MultiStepExperimentForm = ({
       inputVariables: expectedColumns || [],
       outputVariableType: PromptType.Text,
       outputVariableName: "expected_output",
+      usesMetadata,
     },
   };
   const evaluatorState = {

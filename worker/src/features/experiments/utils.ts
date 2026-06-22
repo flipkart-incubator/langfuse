@@ -4,9 +4,9 @@ import {
   ChatMessageType,
   compileChatMessages,
   extractPlaceholderNames,
-  extractVariables,
   MessagePlaceholderValues,
   Prisma,
+  PromptConfigSchema,
   PromptContent,
   PromptType,
   stringifyValue,
@@ -21,6 +21,8 @@ import {
   ExperimentMetadataSchema,
   LLMApiKeySchema,
   PromptContentSchema,
+  extractTemplateVariables,
+  type TemplateFormat,
 } from "@langfuse/shared/src/server";
 import { prisma } from "@langfuse/shared/src/db";
 import z from "zod";
@@ -75,6 +77,8 @@ export const replaceVariablesInPrompt = (
   itemInput: Record<string, any> | null,
   variables: string[],
   placeholderNames: string[] = [],
+  metadata?: Record<string, any>,
+  format: TemplateFormat = "default",
 ): ChatMessage[] => {
   if (!itemInput) {
     throw Error("Dataset item has no input.");
@@ -88,11 +92,17 @@ export const replaceVariablesInPrompt = (
       ),
     );
 
-    // Apply template ONLY if the content contains `{{variable}}` pattern
-    if (content.includes("{{")) {
-      return compileTemplateString(content, filteredContext);
+    // Always inject metadata into context (dataset metadata wins on collision)
+    const fullContext: Record<string, any> = {
+      ...filteredContext,
+      ...(metadata ? { metadata } : {}),
+    };
+
+    // Apply template if the content contains template syntax
+    if (content.includes("{{") || content.includes("{%")) {
+      return compileTemplateString(content, fullContext, format);
     }
-    return content; // Return original content if no placeholders are found
+    return content; // Return original content if no template syntax found
   };
   if (typeof prompt === "string") {
     return [
@@ -146,6 +156,7 @@ export const replaceVariablesInPrompt = (
     prompt as PromptMessage[],
     placeholderValues,
     {},
+    format,
   );
   return compiledMessages.map((message) => ({
     ...message,
@@ -196,6 +207,12 @@ export async function validateAndSetupExperiment(
     throw new UnrecoverableError(`Prompt ${prompt_id} has invalid format`);
   }
 
+  // Extract templateFormat from prompt config
+  const promptConfig = PromptConfigSchema.safeParse(prompt.config);
+  const templateFormat: TemplateFormat = promptConfig.success
+    ? promptConfig.data.templateFormat
+    : "default";
+
   // Fetch and validate API key
   const apiKey = await prisma.llmApiKeys.findFirst({
     where: { projectId, provider },
@@ -209,8 +226,8 @@ export async function validateAndSetupExperiment(
     throw new UnrecoverableError(`API key for provider ${provider} not found`);
   }
 
-  // Extract variables from prompt
-  const extractedVariables = extractVariables(
+  // Extract variables from prompt (Jinja2-aware)
+  const extractedVariables = extractTemplateVariables(
     prompt?.type === PromptType.Text
       ? (prompt.prompt?.toString() ?? "")
       : JSON.stringify(prompt.prompt),
@@ -235,6 +252,7 @@ export async function validateAndSetupExperiment(
     experimentName: validatedRunMetadata.data.experiment_name,
     experimentRunName: validatedRunMetadata.data.experiment_run_name,
     datasetVersion: validatedRunMetadata.data.dataset_version,
+    templateFormat,
     allVariables,
     placeholderNames,
     projectId,
