@@ -64,7 +64,9 @@ import {
   renderRichPromptContent,
 } from "@/src/components/ui/PromptReferences";
 import { PromptVariableListPreview } from "@/src/features/prompts/components/PromptVariableListPreview";
+import { Jinja2ResolutionPanel } from "@/src/features/prompts/components/Jinja2ResolutionPanel";
 import { createBreadcrumbItems } from "@/src/features/folders/utils";
+import { PromptConfigSchema } from "@langfuse/shared";
 
 const getPythonCode = (
   name: string,
@@ -266,6 +268,73 @@ export const PromptDetail = ({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [prompt?.id]);
+
+  const promptConfig = PromptConfigSchema.parse(
+    typeof prompt?.config === "object" && prompt.config !== null
+      ? prompt.config
+      : {},
+  );
+  const templateFormat = promptConfig.templateFormat ?? "default";
+
+  const promptText =
+    prompt?.type === PromptType.Text
+      ? (prompt.prompt?.toString() ?? "")
+      : JSON.stringify(prompt?.prompt ?? "");
+
+  const jinja2Variables = useMemo(() => {
+    if (templateFormat !== "jinja2") return [];
+    // Scan the resolved template so variables from all referenced child prompts
+    // (and deeply nested chains) surface as inputs, not just the top-level template.
+    const templateToScan =
+      promptGraph.data?.resolvedPrompt &&
+      typeof promptGraph.data.resolvedPrompt === "string"
+        ? promptGraph.data.resolvedPrompt
+        : promptText;
+    if (!templateToScan) return [];
+    const matches = new Set<string>();
+    const varRegex = /{{\s*([\w.]+)\s*(?:\|[^}]*)?\s*}}/g;
+    let m;
+    while ((m = varRegex.exec(templateToScan)) !== null) {
+      const name = m[1].split(".")[0];
+      if (name && !["loop"].includes(name)) matches.add(name);
+    }
+    const forRegex = /{%[-\s]*for\s+\w+\s+in\s+([\w.]+)\s*[-\s]*%}/g;
+    while ((m = forRegex.exec(templateToScan)) !== null) {
+      if (m[1]) matches.add(m[1]);
+    }
+    const ifRegex = /{%[-\s]*(?:if|elif)\s+([^%]*?)[-\s]*%}/g;
+    const jinja2Keywords = new Set([
+      "and",
+      "or",
+      "not",
+      "if",
+      "elif",
+      "else",
+      "is",
+      "in",
+      "true",
+      "false",
+      "none",
+      "null",
+    ]);
+    while ((m = ifRegex.exec(templateToScan)) !== null) {
+      if (m[1]) {
+        // Strip string literals so quoted values like 'napan' aren't treated as variable names
+        const conditionWithoutStrings = m[1]
+          .replace(/'[^']*'/g, "")
+          .replace(/"[^"]*"/g, "");
+        const varMatches =
+          conditionWithoutStrings.matchAll(/\b([a-zA-Z_]\w*)\b/g);
+        for (const varMatch of varMatches) {
+          const varName = varMatch[1];
+          if (!jinja2Keywords.has(varName.toLowerCase())) {
+            matches.add(varName);
+          }
+        }
+      }
+    }
+    return Array.from(matches);
+  }, [templateFormat, promptText, promptGraph.data?.resolvedPrompt]);
 
   if (!promptHistory.data || !prompt) {
     return <div className="p-3">Loading...</div>;
@@ -566,6 +635,17 @@ export const PromptDetail = ({
                   )}
                 </PromptReferenceProvider>
                 <PromptVariableListPreview variables={extractedVariables} />
+                {templateFormat === "jinja2" && jinja2Variables.length > 0 && (
+                  <Jinja2ResolutionPanel
+                    template={
+                      promptGraph.data?.resolvedPrompt &&
+                      typeof promptGraph.data.resolvedPrompt === "string"
+                        ? promptGraph.data.resolvedPrompt
+                        : promptText
+                    }
+                    variables={jinja2Variables}
+                  />
+                )}
               </div>
             </TabsBarContent>
             <TabsBarContent
