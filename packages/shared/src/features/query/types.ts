@@ -1,5 +1,21 @@
+import { isoDateTime } from "../../utils/zod";
 import { z } from "zod";
-import { singleFilter } from "../../interfaces/filters";
+import { singleFilterList } from "../../interfaces/filters";
+
+export const metricAggregations = z.enum([
+  "sum",
+  "avg",
+  "count",
+  "max",
+  "min",
+  "p50",
+  "p75",
+  "p90",
+  "p95",
+  "p99",
+  "histogram",
+  "uniq",
+]);
 
 export type ViewDeclarationType = z.infer<typeof viewDeclaration>;
 export type DimensionsDeclarationType = z.infer<
@@ -31,7 +47,13 @@ export const viewDeclaration = z.object({
         .optional(),
       highCardinality: z.boolean().optional(),
       uiHidden: z.boolean().optional(),
+      // Expands dimension.sql independently with arrayJoin(), producing one row
+      // per array element. Duplicate elements duplicate the source row; use
+      // arrayDistinct(...) in sql when the intended grain is entity + distinct value.
       explodeArray: z.boolean().optional(),
+      // Expands dimension.sql and valuesSql together in one ARRAY JOIN, pairing
+      // elements by position and exposing valueAlias to a dependent measure.
+      // Only one pairExpand dimension is supported per query, and it cannot be filtered.
       pairExpand: z
         .object({
           valuesSql: z.string(),
@@ -49,10 +71,27 @@ export const viewDeclaration = z.object({
       description: z.string().optional(),
       type: z.string().optional(),
       unit: z.string().optional(),
+      // Natural aggregation the widget builder preselects when the user
+      // switches to this measure (e.g. `sum` for toolCalls, where a carried-over
+      // `count` would count observations instead of tool calls). UI-only
+      // default; the query builder never reads it.
+      defaultAggregation: metricAggregations.optional(),
       aggs: z.record(z.string(), z.string()).optional(),
-      // When set, the query builder will auto-include this dimension if it is absent.
-      // Used for pairExpand value-alias measures (e.g. costByType requires costType so
-      // the ARRAY JOIN is emitted and "cost_value" is in scope).
+      // Override query semantics for specific user-selected aggregations while
+      // keeping the base declaration as the UI/default compatibility contract.
+      aggregationOverrides: z
+        .record(
+          z.string(),
+          z.object({
+            sql: z.string(),
+            type: z.string().optional(),
+            aggs: z.record(z.string(), z.string()).optional(),
+            queryAggregation: metricAggregations.optional(),
+          }),
+        )
+        .optional(),
+      // Auto-includes a dimension needed to evaluate the measure, including its
+      // explodeArray or pairExpand behavior and resulting aliases.
       requiresDimension: z.string().optional(),
     }),
   ),
@@ -66,7 +105,7 @@ export const viewDeclaration = z.object({
     }),
   ),
   // Segments are used to apply "constant" filters to the query. For example, if we only want one type of observations.
-  segments: z.array(singleFilter),
+  segments: singleFilterList,
   timeDimension: z.string(),
   // When set, adds a subquery filter to restrict rows to those whose "root event"
   // (matching the condition) has timeDimension in the query window.
@@ -74,29 +113,54 @@ export const viewDeclaration = z.object({
     .object({
       // The column used to match root entities between outer query and subquery (e.g., "trace_id").
       column: z.string(),
-      // SQL condition identifying root events (e.g., "parent_span_id = ''").
+      // Fully qualified, self-contained SQL condition identifying root events.
       condition: z.string(),
     })
     .optional(),
 });
 
-const stringDateTime = z.iso.datetime({ offset: true });
+const stringDateTime = isoDateTime({ offset: true });
 
 export const views = z.enum([
   "traces",
   "observations",
   "scores-numeric",
   "scores-categorical",
+  "scores-boolean",
   // "sessions",
   // "users",
 ]);
 
-// V2 views - excludes "traces" which is not supported in v2 API
+// Public v2 API views - excludes "traces". Internal dashboard queries still
+// support the events-backed v2 traces declaration for legacy widget parity.
 export const viewsV2 = z.enum([
   "observations",
   "scores-numeric",
   "scores-categorical",
+  "scores-boolean",
 ]);
+
+/**
+ * Internal-only view name (see `dataModel.ts`), deliberately NOT a member of
+ * `views`/`viewsV2` — those are iterated by the public metrics API and the
+ * widget-builder view picker, and this powers only one internal call site.
+ * Unioned onto the internal `query` schema below instead.
+ */
+export const SCORES_LISTABLE_COUNT_VIEW = "scores-listable-count" as const;
+
+/**
+ * Persisted dashboard-widget view ids → query view ids. Lives here (not with
+ * the server-only DashboardService types) so client code can classify a stored
+ * widget; DashboardService's Prisma-keyed map is this constant, so the two
+ * cannot drift.
+ */
+export const persistedWidgetViewToQueryView = {
+  TRACES: "traces",
+  OBSERVATIONS: "observations",
+  SCORES_NUMERIC: "scores-numeric",
+  SCORES_BOOLEAN: "scores-boolean",
+  SCORES_CATEGORICAL: "scores-categorical",
+} as const satisfies Record<string, z.infer<typeof views>>;
 
 export const viewVersions = z.enum(["v1", "v2"]);
 export type ViewVersion = z.infer<typeof viewVersions>;
@@ -105,26 +169,10 @@ export const dimension = z.object({
   field: z.string(),
 });
 
-export const metricAggregations = z.enum([
-  "sum",
-  "avg",
-  "count",
-  "max",
-  "min",
-  "p50",
-  "p75",
-  "p90",
-  "p95",
-  "p99",
-  "histogram",
-  "uniq",
-]);
+/** MeasureDefinition is a single `measures` entry on a ViewDeclaration. */
+export type MeasureDefinition = ViewDeclarationType["measures"][string];
 
-/**
- * Returns the subset of aggregations that are valid for a given measure type.
- * Whitelists known numeric types; unknown or missing types default to the
- * restrictive count/uniq set to surface missing type annotations early.
- */
+/** getValidAggregationsForMeasureType returns the aggregations valid for a measure type: every aggregation for numeric types, or `count`/`uniq` otherwise. */
 export function getValidAggregationsForMeasureType(
   measureType: string | undefined,
 ): z.infer<typeof metricAggregations>[] {
@@ -143,6 +191,7 @@ export const metric = z.object({
   aggregation: metricAggregations,
 });
 
+/** granularities is the superset of time-bucket tokens: the 6 base options plus the 10 Monitor window increments. */
 export const granularities = z.enum([
   "auto",
   "minute",
@@ -150,16 +199,30 @@ export const granularities = z.enum([
   "day",
   "week",
   "month",
+  "5m",
+  "10m",
+  "15m",
+  "30m",
+  "1h",
+  "2h",
+  "4h",
+  "1d",
+  "2d",
+  "1w",
 ]);
 
 export type QueryType = z.infer<typeof query>;
 
 export const query = z
   .object({
-    view: views,
+    // See `SCORES_LISTABLE_COUNT_VIEW`'s doc comment: unioned on here (the
+    // internal query schema) rather than added to `views` itself, so it
+    // stays out of the public metrics API and the widget-builder view
+    // picker, both of which read `views`/`viewsV2` directly.
+    view: z.union([views, z.literal(SCORES_LISTABLE_COUNT_VIEW)]),
     dimensions: z.array(dimension),
     metrics: z.array(metric),
-    filters: z.array(singleFilter),
+    filters: singleFilterList,
     timeDimension: z
       .object({
         // TODO: We may want to extend this and allow custom intervals like 3h in the future.
@@ -167,6 +230,16 @@ export const query = z
         granularity: granularities,
       })
       .nullable(),
+    // Entity dimension for bucketing by a categorical field (e.g., experimentName).
+    // IMPORTANT: Unlike timeDimension which has implicit bucket limits (24 hours/day),
+    // entityDimension has NO cardinality guarantee. Callers MUST filter the same
+    // entity field in WHERE before GROUP BY runs (max ~50 values).
+    // Without this pre-filtering, GROUP BY on high-cardinality columns will be slow/OOM.
+    entityDimension: z
+      .object({
+        field: z.string(), // e.g., "experimentName"
+      })
+      .nullish(),
     fromTimestamp: stringDateTime,
     toTimestamp: stringDateTime,
     orderBy: z
@@ -190,6 +263,13 @@ export const query = z
     (query) =>
       // Ensure fromTimestamp is before toTimestamp
       new Date(query.fromTimestamp) < new Date(query.toTimestamp),
+    { message: "fromTimestamp must be before toTimestamp" },
+  )
+  .refine(
+    (query) =>
+      // timeDimension and entityDimension are mutually exclusive
+      !(query.timeDimension && query.entityDimension),
+    { message: "timeDimension and entityDimension are mutually exclusive" },
   );
 
 export const useEventsTableSchema = z

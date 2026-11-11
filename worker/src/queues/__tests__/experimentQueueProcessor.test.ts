@@ -13,14 +13,14 @@ vi.mock("@langfuse/shared/src/server", () => ({
   QueueName: {
     ExperimentCreate: "experiment-create-queue",
   },
-  isLLMCompletionError: vi.fn(),
+  classifyEvaluatorLlmError: vi.fn(),
   logger: {
     error: vi.fn(),
   },
   traceException: vi.fn(),
 }));
 
-vi.mock("../../features/utils", () => ({
+vi.mock("../../features/utils/retry-handler", () => ({
   retryLLMRateLimitError: vi.fn(),
 }));
 
@@ -36,9 +36,9 @@ vi.mock("../../errors/UnrecoverableError", async () => {
   };
 });
 
-import { isLLMCompletionError } from "@langfuse/shared/src/server";
+import { classifyEvaluatorLlmError } from "@langfuse/shared/src/server";
 import { createExperimentJobClickhouse } from "../../features/experiments/experimentServiceClickhouse";
-import { retryLLMRateLimitError } from "../../features/utils";
+import { retryLLMRateLimitError } from "../../features/utils/retry-handler";
 import { experimentCreateQueueProcessor } from "../experimentQueue";
 import { isUnrecoverableError } from "../../errors/UnrecoverableError";
 
@@ -55,15 +55,20 @@ describe("experimentCreateQueueProcessor", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    (isLLMCompletionError as Mock).mockReturnValue(false);
+    (classifyEvaluatorLlmError as Mock).mockReturnValue(null);
     (isUnrecoverableError as Mock).mockReturnValue(false);
   });
 
   it("rethrows retryable LLM errors when the retry queue is unavailable", async () => {
     const llmError = new Error("Rate limit exceeded");
-    (llmError as Error & { isRetryable: boolean }).isRetryable = true;
     (createExperimentJobClickhouse as Mock).mockRejectedValue(llmError);
-    (isLLMCompletionError as Mock).mockReturnValue(true);
+    (classifyEvaluatorLlmError as Mock).mockReturnValue({
+      kind: "provider",
+      message: llmError.message,
+      isRetryable: true,
+      error: llmError,
+      blockReason: null,
+    });
     (retryLLMRateLimitError as Mock).mockResolvedValue({
       outcome: "queue_unavailable",
     });

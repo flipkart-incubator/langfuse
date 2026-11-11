@@ -2,18 +2,16 @@ import {
   queryClickhouse,
   type ClickhouseQueryOpts,
 } from "../../../server/repositories/clickhouse";
-import { measureAndReturn } from "../../../server/clickhouse/measureAndReturn";
 import { type PreferredClickhouseService } from "../../../server/clickhouse/client";
 import { QueryBuilder } from "./queryBuilder";
 import { type QueryType, type ViewVersion } from "../types";
-import { getViewDeclaration } from "../dataModel";
 import { env } from "../../../env";
 
 export type PreparedQuery = {
   compiledQuery: string;
   parameters: Record<string, unknown>;
   preferredClickhouseService: PreferredClickhouseService | undefined;
-  tags: Record<string, string>;
+  tags: { projectId: string };
   clickhouseSettings: Record<string, string>;
   usesTraceTable: boolean;
   fromTimestamp: string;
@@ -44,17 +42,17 @@ export async function prepareExecuteQuery(opts: {
       env.LANGFUSE_ENABLE_SINGLE_LEVEL_QUERY_OPTIMIZATION === "true",
   );
 
-  const view = getViewDeclaration(query.view, version);
-  const preferredClickhouseService = view.baseCte.includes("events_")
+  // v2 score views are score-based, but can add events_core joins for
+  // trace/observation dimensions. Route based on the compiled query so only
+  // generated queries that actually touch events use the events readonly pool.
+  const usesEventsTable =
+    compiledQuery.includes("events_core") ||
+    compiledQuery.includes("events_full");
+  const preferredClickhouseService = usesEventsTable
     ? ("EventsReadOnly" as const)
     : undefined;
 
-  const tags = {
-    feature: "custom-queries",
-    type: query.view,
-    kind: "analytic",
-    projectId,
-  };
+  const tags = { projectId };
 
   const clickhouseSettings: Record<string, string> = {
     date_time_output_format: "iso",
@@ -83,6 +81,8 @@ export function toClickhouseQueryOpts(
   return {
     query: prepared.compiledQuery,
     params: prepared.parameters,
+    // Large filter values (e.g. long IN lists) would overflow the URL.
+    useMultipartParamsAuto: true,
     clickhouseSettings: prepared.clickhouseSettings,
     tags: prepared.tags,
     preferredClickhouseService: prepared.preferredClickhouseService,
@@ -93,7 +93,8 @@ export async function executeQuery(
   projectId: string,
   query: QueryType,
   version: ViewVersion = "v1",
-  enableSingleLevelOptimization: boolean = false,
+  enableSingleLevelOptimization = false,
+  options?: Pick<ClickhouseQueryOpts, "clickhouseSettings">,
 ): Promise<Array<Record<string, unknown>>> {
   const prepared = await prepareExecuteQuery({
     projectId,
@@ -103,30 +104,19 @@ export async function executeQuery(
   });
 
   const chOpts = toClickhouseQueryOpts(prepared);
+  chOpts.clickhouseSettings = {
+    ...chOpts.clickhouseSettings,
+    ...options?.clickhouseSettings,
+  };
 
   if (!prepared.usesTraceTable) {
     return queryClickhouse<Record<string, unknown>>(chOpts);
   }
 
-  return measureAndReturn({
-    operationName: "executeQuery",
-    projectId,
-    input: {
-      query: prepared.compiledQuery,
-      params: prepared.parameters,
-      fromTimestamp: prepared.fromTimestamp,
-      tags: {
-        ...prepared.tags,
-        operation_name: "executeQuery",
-      },
-    },
-    fn: async (input) => {
-      return queryClickhouse<Record<string, unknown>>({
-        ...chOpts,
-        query: input.query,
-        params: input.params,
-        tags: input.tags,
-      });
-    },
+  return queryClickhouse<Record<string, unknown>>({
+    ...chOpts,
+    query: prepared.compiledQuery,
+    params: prepared.parameters,
+    tags: prepared.tags,
   });
 }

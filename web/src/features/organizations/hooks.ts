@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-use-before-define */
 import { env } from "@/src/env.mjs";
 import { useSession } from "next-auth/react";
 import { useRouter } from "next/router";
@@ -13,23 +14,35 @@ export const useQueryOrganization = () => {
   );
 };
 
-export const useOrganization = (organizationId: string | null) => {
+const useOrganization = (organizationId: string | null) => {
   const session = useSession();
 
-  // Always call hooks first, then handle conditional logic in the return
-  const organization = organizationId
-    ? session.data?.user?.organizations.find((org) => org.id === organizationId)
-    : null;
+  if (!organizationId) return null;
 
-  return organization ?? null;
+  return (
+    session.data?.user?.organizations.find(
+      (org) => org.id === organizationId,
+    ) ?? null
+  );
 };
 
-export const useLangfuseCloudRegion = (): {
-  isLangfuseCloud: boolean;
-  region: string | undefined;
-} => {
+export const useLangfuseCloudRegion = () => {
+  const region = env.NEXT_PUBLIC_LANGFUSE_CLOUD_REGION ?? undefined;
+
+  if (!region) {
+    return {
+      isLangfuseCloud: false,
+      region: undefined,
+    } as const;
+  }
+
   return {
-    isLangfuseCloud: Boolean(env.NEXT_PUBLIC_LANGFUSE_CLOUD_REGION),
-    region: env.NEXT_PUBLIC_LANGFUSE_CLOUD_REGION,
-  };
+    isLangfuseCloud: true,
+    region,
+  } as const;
+};
+
+export const useLangfuseV4WriteMode = () => {
+  const session = useSession();
+  return session.data?.environment.v4WriteMode ?? null;
 };

@@ -1,4 +1,6 @@
+/* eslint-disable @typescript-eslint/no-use-before-define */
 import { parseClickhouseUTCDateTimeFormat } from "./clickhouse";
+import { normalizeEventsTraceName } from "../../eventsTable";
 import {
   ObservationRecordReadType,
   EventsObservationRecordReadType,
@@ -11,7 +13,7 @@ import {
   PartialEventsObservation,
   PartialObservation,
   ObservationCoreFields,
-} from "../../domain";
+} from "../../domain/observations";
 import { parseMetadataCHRecordToDomain } from "../utils/metadata_conversion";
 import {
   RenderingProps,
@@ -47,7 +49,9 @@ export const createModelCache = (projectId: string) => {
         OR: [{ projectId }, { projectId: null }],
       },
       include: {
-        Price: true,
+        Price: {
+          where: { pricingTier: { isDefault: true } },
+        },
       },
     });
 
@@ -405,6 +409,14 @@ export function convertEventsObservation(
   renderingProps: RenderingProps = DEFAULT_RENDERING_PROPS,
   complete: boolean,
 ): EventsObservation | PartialEventsObservation {
+  const skills = {
+    ...(record.skills_available !== undefined && {
+      skillsAvailable: record.skills_available,
+    }),
+    ...(record.skills_resource_loaded !== undefined && {
+      skillsResourceLoaded: record.skills_resource_loaded,
+    }),
+  };
   if (complete) {
     const baseObservation = convertObservationPartial(
       record as ObservationRecordReadType,
@@ -413,9 +425,13 @@ export function convertEventsObservation(
     );
     return {
       ...baseObservation,
+      ...skills,
       userId: record.user_id ?? null,
       sessionId: record.session_id ?? null,
-      traceName: record.trace_name ?? null,
+      ...(record.is_root_observation !== undefined && {
+        isRootObservation: record.is_root_observation,
+      }),
+      traceName: normalizeEventsTraceName(record.trace_name),
       release: record.release ?? null,
       tags: record.tags ?? null,
       bookmarked: record.bookmarked!,
@@ -430,9 +446,15 @@ export function convertEventsObservation(
   );
   return {
     ...baseObservation,
+    ...skills,
     ...(record.user_id !== undefined && { userId: record.user_id }),
     ...(record.session_id !== undefined && { sessionId: record.session_id }),
-    ...(record.trace_name !== undefined && { traceName: record.trace_name }),
+    ...(record.is_root_observation !== undefined && {
+      isRootObservation: record.is_root_observation,
+    }),
+    ...(record.trace_name !== undefined && {
+      traceName: normalizeEventsTraceName(record.trace_name),
+    }),
     ...(record.release !== undefined && { release: record.release }),
     ...(record.tags !== undefined && { tags: record.tags }),
     ...(record.bookmarked !== undefined && { bookmarked: record.bookmarked }),
@@ -449,17 +471,19 @@ export const reduceUsageOrCostDetails = (
 } => {
   return {
     input: Object.entries(details ?? {})
-      .filter(([usageType]) => usageType.startsWith("input"))
+      .filter(([usageType]) => usageType.includes("input"))
       .reduce(
         (acc, [, value]) => (acc ?? 0) + Number(value),
         null as number | null, // default to null if no input usage is found
       ),
     output: Object.entries(details ?? {})
-      .filter(([usageType]) => usageType.startsWith("output"))
+      .filter(([usageType]) => usageType.includes("output"))
       .reduce(
         (acc, [, value]) => (acc ?? 0) + Number(value),
         null as number | null, // default to null if no output usage is found
       ),
-    total: Number(details?.total ?? 0),
+    // Keep an explicit 0 (deliberate zero cost/usage). A missing `total` key
+    // is null so callers can distinguish "no value" from zero.
+    total: details?.total != null ? Number(details.total) : null,
   };
 };

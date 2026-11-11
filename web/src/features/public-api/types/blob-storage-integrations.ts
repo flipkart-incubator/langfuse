@@ -2,25 +2,48 @@ import { z } from "zod";
 import {
   AnalyticsIntegrationExportSource,
   OBSERVATION_FIELD_GROUPS_FULL,
+  SCORE_EXPORT_FIELD_GROUPS,
+  BLOB_STORAGE_REGION_INVALID_MESSAGE,
+  BLOB_STORAGE_REGION_REGEX,
+  STORAGE_ROLE_ARN_INVALID_MESSAGE,
+  STORAGE_ROLE_ARN_REGEX,
 } from "@langfuse/shared";
 import {
   validateAzureContainerName,
   validateExportFieldGroups,
+  exportStartDateNotInFuture,
+  EXPORT_START_DATE_FUTURE_ERROR,
 } from "@/src/features/blobstorage-integration/validation";
-
 /**
  * Enums
  */
 
-export const BlobStorageIntegrationType = z.enum([
+const BlobStorageIntegrationType = z.enum([
   "S3",
   "S3_COMPATIBLE",
   "AZURE_BLOB_STORAGE",
+  "GOOGLE_CLOUD_STORAGE",
 ]);
 
-export const BlobStorageIntegrationFileType = z.enum(["JSON", "CSV", "JSONL"]);
+const BlobStorageIntegrationAuthType = z.enum(["ACCESS_KEYS", "ROLE_ARN"]);
 
-export const BlobStorageExportMode = z.enum([
+const BlobStorageIntegrationFileType = z.enum([
+  "JSON",
+  "CSV",
+  "JSONL",
+  "PARQUET",
+]);
+
+// Kept as a separate export for the response type. Now identical to the request
+// enum since Parquet is generally available and settable via the API.
+const BlobStorageIntegrationFileTypeResponse = z.enum([
+  "JSON",
+  "CSV",
+  "JSONL",
+  "PARQUET",
+]);
+
+const BlobStorageExportMode = z.enum([
   "FULL_HISTORY",
   "FROM_TODAY",
   "FROM_CUSTOM_DATE",
@@ -71,9 +94,23 @@ export const toPublicExportSource = (
 ): z.infer<typeof BlobStorageExportSource> =>
   INTERNAL_TO_PUBLIC_EXPORT_SOURCE[internalValue];
 
-export const BlobStorageExportFieldGroup = z.enum(
-  OBSERVATION_FIELD_GROUPS_FULL,
-);
+// Trace groups are configurable in the UI only and never cross the public API,
+// so SDKs never receive a value outside this enum.
+const PUBLIC_EXPORT_FIELD_GROUPS = [
+  ...OBSERVATION_FIELD_GROUPS_FULL,
+  ...SCORE_EXPORT_FIELD_GROUPS,
+] as const;
+
+const BlobStorageExportFieldGroup = z.enum(PUBLIC_EXPORT_FIELD_GROUPS);
+
+type PublicExportFieldGroup = z.infer<typeof BlobStorageExportFieldGroup>;
+
+export const toPublicExportFieldGroups = (
+  groups: readonly string[],
+): PublicExportFieldGroup[] =>
+  groups.filter((group): group is PublicExportFieldGroup =>
+    (PUBLIC_EXPORT_FIELD_GROUPS as readonly string[]).includes(group),
+  );
 
 /**
  * Request/Response Types
@@ -85,9 +122,20 @@ export const CreateBlobStorageIntegrationRequest = z
     type: BlobStorageIntegrationType,
     bucketName: z.string().min(1),
     endpoint: z.string().nullable().optional(),
-    region: z.string(),
+    region: z.string().trim().min(1).regex(BLOB_STORAGE_REGION_REGEX, {
+      message: BLOB_STORAGE_REGION_INVALID_MESSAGE,
+    }),
+    authType: BlobStorageIntegrationAuthType.optional(),
     accessKeyId: z.string().nullable().optional(),
     secretAccessKey: z.string().nullable().optional(),
+    roleArn: z
+      .string()
+      .trim()
+      .regex(STORAGE_ROLE_ARN_REGEX, {
+        message: STORAGE_ROLE_ARN_INVALID_MESSAGE,
+      })
+      .nullable()
+      .optional(),
     prefix: z
       .string()
       .optional()
@@ -96,12 +144,18 @@ export const CreateBlobStorageIntegrationRequest = z
         (value) => value === "" || value.endsWith("/"),
         "Prefix must be empty or end with a forward slash",
       ),
-    exportFrequency: z.string(),
+    exportFrequency: z.enum(["every_20_minutes", "hourly", "daily", "weekly"]),
     enabled: z.boolean(),
     forcePathStyle: z.boolean(),
     fileType: BlobStorageIntegrationFileType,
     exportMode: BlobStorageExportMode,
-    exportStartDate: z.coerce.date().nullable().optional(),
+    exportStartDate: z.coerce
+      .date()
+      .refine(exportStartDateNotInFuture, {
+        message: EXPORT_START_DATE_FUTURE_ERROR,
+      })
+      .nullable()
+      .optional(),
     compressed: z.boolean().optional().default(true),
     exportSource: BlobStorageExportSource.nullable().optional(),
     exportFieldGroups: z
@@ -122,6 +176,24 @@ export const CreateBlobStorageIntegrationRequest = z
   )
   .superRefine(validateAzureContainerName)
   .superRefine((data, ctx) => {
+    if (data.authType !== "ROLE_ARN") return;
+    if (data.type !== "S3") {
+      ctx.addIssue({
+        code: "custom",
+        message: "authType ROLE_ARN is only available for type S3",
+        path: ["authType"],
+      });
+    }
+    if (data.accessKeyId || data.secretAccessKey) {
+      ctx.addIssue({
+        code: "custom",
+        message:
+          "accessKeyId and secretAccessKey must not be set when authType is ROLE_ARN",
+        path: ["authType"],
+      });
+    }
+  })
+  .superRefine((data, ctx) => {
     if (data.exportSource == null && data.exportFieldGroups != null) {
       ctx.addIssue({
         code: "custom",
@@ -130,30 +202,15 @@ export const CreateBlobStorageIntegrationRequest = z
       });
       return;
     }
-    if (
-      data.exportSource === "LEGACY_TRACES_OBSERVATIONS" &&
-      data.exportFieldGroups != null
-    ) {
-      ctx.addIssue({
-        code: "custom",
-        message:
-          "exportFieldGroups is not applicable when exportSource is LEGACY_TRACES_OBSERVATIONS",
-        path: ["exportFieldGroups"],
-      });
-      return;
-    }
     if (data.exportFieldGroups != null && data.exportSource != null) {
       validateExportFieldGroups(
-        {
-          exportSource: toInternalExportSource(data.exportSource),
-          exportFieldGroups: data.exportFieldGroups,
-        },
+        { exportFieldGroups: data.exportFieldGroups },
         ctx,
       );
     }
   });
 
-export const BlobStorageIntegrationResponse = z
+const BlobStorageIntegrationResponse = z
   .object({
     id: z.string(),
     projectId: z.string(),
@@ -161,12 +218,16 @@ export const BlobStorageIntegrationResponse = z
     bucketName: z.string(),
     endpoint: z.string().nullable(),
     region: z.string(),
+    authType: BlobStorageIntegrationAuthType,
     accessKeyId: z.string().nullable(),
+    roleArn: z.string().nullable(),
+    externalId: z.string().nullable(),
+    crossAccountRoleArn: z.string().nullable(),
     prefix: z.string(),
     exportFrequency: z.string(),
     enabled: z.boolean(),
     forcePathStyle: z.boolean(),
-    fileType: BlobStorageIntegrationFileType,
+    fileType: BlobStorageIntegrationFileTypeResponse,
     exportMode: BlobStorageExportMode,
     exportStartDate: z.coerce.date().nullable(),
     compressed: z.boolean(),
@@ -185,15 +246,16 @@ export type BlobStorageIntegrationResponseType = z.infer<
   typeof BlobStorageIntegrationResponse
 >;
 
-export const BlobStorageSyncStatus = z.enum([
+const BlobStorageSyncStatus = z.enum([
   "idle",
+  "running",
   "queued",
   "up_to_date",
   "disabled",
   "error",
 ]);
 
-export const BlobStorageIntegrationStatusResponse = z
+const BlobStorageIntegrationStatusResponse = z
   .object({
     id: z.string(),
     projectId: z.string(),

@@ -1,7 +1,7 @@
 import {
   matchesUiColumnMapping,
   UiColumnMappings,
-} from "../../tableDefinitions";
+} from "../../tableDefinitions/types";
 import { DatasetRunItemDomain } from "../../domain/dataset-run-items";
 
 export const datasetRunItemsTableUiColumnDefinitions: UiColumnMappings = [
@@ -46,6 +46,12 @@ export const datasetRunItemsTableUiColumnDefinitions: UiColumnMappings = [
     uiTableId: "agg_score_categories",
     clickhouseTableName: "scores",
     clickhouseSelect: "sa.score_categories",
+  },
+  {
+    uiTableName: "Scores (boolean)",
+    uiTableId: "agg_score_booleans",
+    clickhouseTableName: "scores",
+    clickhouseSelect: "sa.score_booleans",
   },
 ];
 

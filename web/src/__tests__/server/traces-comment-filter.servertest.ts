@@ -1,3 +1,4 @@
+import { testFeatureFlags } from "@/src/__tests__/fixtures/feature-flags";
 import type { Session } from "next-auth";
 import { prisma } from "@langfuse/shared/src/db";
 import { appRouter } from "@/src/server/api/root";
@@ -30,6 +31,9 @@ describe("Traces Comment Filtering", () => {
             role: "OWNER",
             plan: "cloud:hobby",
             cloudConfig: undefined,
+            metadata: {},
+            aiFeaturesEnabled: false,
+            aiTelemetryEnabled: false,
             projects: [
               {
                 id: projectId,
@@ -37,20 +41,19 @@ describe("Traces Comment Filtering", () => {
                 retentionDays: 30,
                 deletedAt: null,
                 name: "Test Project",
+                hasTraces: true,
+                metadata: {},
+                createdAt: new Date().toISOString(),
               },
             ],
           },
         ],
-        featureFlags: {
-          excludeClickhouseRead: false,
-          templateFlag: true,
-        },
-        admin: true,
+        featureFlags: testFeatureFlags(),
       },
       environment: {} as any,
     };
 
-    const ctx = createInnerTRPCContext({ session });
+    const ctx = createInnerTRPCContext({ session, headers: {} });
     caller = appRouter.createCaller({ ...ctx, prisma });
   });
 
@@ -187,6 +190,60 @@ describe("Traces Comment Filtering", () => {
       const traceIds = result.traces.map((t) => t.id);
       expect(traceIds).toContain(trace1.id);
       expect(traceIds).not.toContain(trace2.id);
+    });
+
+    it("should filter traces by exact comment content (=)", async () => {
+      const content = `exact-${randomUUID()}`;
+      const createdAfter = new Date(Date.now() - 1000).toISOString();
+      const exactTrace = createTrace({
+        project_id: projectId,
+        id: randomUUID(),
+      });
+      const partialTrace = createTrace({
+        project_id: projectId,
+        id: randomUUID(),
+      });
+      await createTracesCh([exactTrace, partialTrace]);
+
+      await prisma.comment.createMany({
+        data: [
+          {
+            projectId,
+            objectType: "TRACE",
+            objectId: exactTrace.id,
+            content,
+            authorUserId: "user-1",
+          },
+          {
+            projectId,
+            objectType: "TRACE",
+            objectId: partialTrace.id,
+            content: `${content} and more`,
+            authorUserId: "user-1",
+          },
+        ],
+      });
+
+      const result = await caller.traces.all(
+        createQueryParams([
+          {
+            type: "datetime",
+            column: "timestamp",
+            operator: ">=",
+            value: createdAfter,
+          },
+          {
+            type: "string",
+            column: "commentContent",
+            operator: "=",
+            value: content,
+          },
+        ]),
+      );
+
+      const traceIds = result.traces.map((t) => t.id);
+      expect(traceIds).toContain(exactTrace.id);
+      expect(traceIds).not.toContain(partialTrace.id);
     });
   });
 

@@ -1,11 +1,18 @@
 import { z } from "zod/v4";
+import {
+  auditedQuery,
+  ref,
+} from "@/src/features/audit-logs/server/auditedQuery";
 import { randomUUID } from "crypto";
+import { addDays } from "date-fns";
 import {
   type ExperimentMetadata,
   createDatasetItemFilterState,
   ExperimentCreateQueue,
   getCategoricalScoresGroupedByName,
-  getDatasetItems,
+  getBooleanScoresGroupedByName,
+  getDatasetItemsCount,
+  countDatasetItemVariableMatches,
   getEventsGroupedByExperimentDatasetId,
   getExperimentsCountFromEvents,
   getExperimentsFromEvents,
@@ -23,8 +30,10 @@ import {
   ZodModelConfig,
   getScoresForObservations,
   getScoresForTraces,
-  traceException,
+  logger,
   getExperimentNamesFromEvents,
+  getExperimentItemsFilterOptions,
+  getExperimentScoreOptions,
 } from "@langfuse/shared/src/server";
 import {
   createTRPCRouter,
@@ -32,29 +41,40 @@ import {
 } from "@/src/server/api/trpc";
 import {
   extractVariables,
-  validateDatasetItem,
+  isBaseError,
   UnauthorizedError,
   PromptType,
   extractPlaceholderNames,
   type PromptMessage,
-  isPresent,
-  type DatasetItemDomain,
-  singleFilter,
+  singleFilterList,
+  type FilterState,
   orderBy,
   paginationZod,
   timeFilter,
   AGGREGATABLE_SCORE_TYPES,
   filterAndValidateDbScoreList,
+  hasPromptToolStructuredOutputConflict,
+  InvalidRequestError,
+  parsePromptToolConfig,
+  PROMPT_TOOL_STRUCTURED_OUTPUT_CONFLICT_MESSAGE,
 } from "@langfuse/shared";
 import { throwIfNoProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
 import { aggregateScores } from "@/src/features/scores/lib/aggregateScores";
+import { describeVariableMismatch } from "@/src/features/experiments/fns/describeVariableMismatch";
 
 const ExperimentFilterOptions = z.object({
   projectId: z.string(),
-  filter: z.array(singleFilter).nullable(),
+  filter: singleFilterList.nullable(),
   orderBy: orderBy,
   ...paginationZod,
 });
+
+/**
+ * Lookback for `mostRecent`: wide enough to cover a project whose last run is
+ * months old, still bounded so the query prunes partitions instead of scanning
+ * the whole project. Deliberately wider than any table date-range preset.
+ */
+const MOST_RECENT_LOOKBACK_DAYS = 365;
 
 const ValidConfigResponse = z.object({
   isValid: z.literal(true),
@@ -71,39 +91,6 @@ const ConfigResponse = z.discriminatedUnion("isValid", [
   ValidConfigResponse,
   InvalidConfigResponse,
 ]);
-
-const countValidDatasetItems = (
-  datasetItems: Omit<DatasetItemDomain, "status">[],
-  variables: string[],
-): Record<string, number> => {
-  const variableMap: Record<string, number> = {};
-
-  for (const { input } of datasetItems) {
-    // Step 1: Validate item
-    if (!isPresent(input) || !validateDatasetItem(input, variables)) {
-      continue;
-    }
-
-    // Step 2: Count variable matches
-
-    // String with single variable - count that variable
-    if (typeof input === "string" && variables.length === 1) {
-      variableMap[variables[0]] = (variableMap[variables[0]] || 0) + 1;
-      continue;
-    }
-
-    // For object inputs, count each matching variable
-    if (typeof input === "object" && !Array.isArray(input)) {
-      for (const variable of variables) {
-        if (variable in input) {
-          variableMap[variable] = (variableMap[variable] || 0) + 1;
-        }
-      }
-    }
-  }
-
-  return variableMap;
-};
 
 export const experimentsRouter = createTRPCRouter({
   validateConfig: protectedProjectProcedure
@@ -138,7 +125,23 @@ export const experimentsRouter = createTRPCRouter({
       }
 
       const promptService = new PromptService(ctx.prisma, redis);
-      const resolvedPrompt = await promptService.resolvePrompt(prompt);
+      let resolvedPrompt;
+      try {
+        resolvedPrompt = await promptService.resolvePrompt(prompt);
+      } catch (error) {
+        if (
+          error instanceof SyntaxError ||
+          (isBaseError(error) && error.isUserError())
+        ) {
+          return {
+            isValid: false,
+            message: isBaseError(error)
+              ? error.message
+              : "Selected prompt could not be resolved.",
+          };
+        }
+        throw error;
+      }
 
       if (!resolvedPrompt) {
         return {
@@ -148,9 +151,9 @@ export const experimentsRouter = createTRPCRouter({
       }
 
       const extractedVariables = extractVariables(
-        resolvedPrompt?.type === PromptType.Text
+        resolvedPrompt.type === PromptType.Text
           ? (resolvedPrompt.prompt?.toString() ?? "")
-          : JSON.stringify(resolvedPrompt?.prompt),
+          : JSON.stringify(resolvedPrompt.prompt ?? ""),
       );
 
       const promptMessages =
@@ -171,35 +174,42 @@ export const experimentsRouter = createTRPCRouter({
         };
       }
 
-      const items = await getDatasetItems({
+      const filterState = createDatasetItemFilterState({
+        datasetIds: [input.datasetId],
+        status: "ACTIVE",
+      });
+
+      const totalItems = await getDatasetItemsCount({
         projectId: input.projectId,
-        filterState: createDatasetItemFilterState({
-          datasetIds: [input.datasetId],
-          status: "ACTIVE",
-        }),
+        filterState,
         version: input.datasetVersion,
       });
 
-      if (!Boolean(items.length)) {
+      if (!Boolean(totalItems)) {
         return {
           isValid: false,
           message: "Selected dataset is empty or all items are inactive.",
         };
       }
 
-      const variablesMap = countValidDatasetItems(items, allVariables);
+      const variablesMap = await countDatasetItemVariableMatches({
+        projectId: input.projectId,
+        filterState,
+        version: input.datasetVersion,
+        variables: allVariables,
+      });
 
       if (!Boolean(Object.keys(variablesMap).length)) {
         return {
           isValid: false,
-          message: "No dataset item contains any variables.",
+          message: describeVariableMismatch(allVariables),
         };
       }
 
       return {
         isValid: true,
-        totalItems: items.length,
-        variablesMap: variablesMap,
+        totalItems,
+        variablesMap,
       };
     }),
 
@@ -227,6 +237,19 @@ export const experimentsRouter = createTRPCRouter({
         projectId: input.projectId,
         scope: "promptExperiments:CUD",
       });
+
+      if (input.structuredOutputSchema) {
+        const prompt = await ctx.prisma.prompt.findUnique({
+          where: { id: input.promptId, projectId: input.projectId },
+          select: { config: true },
+        });
+        const toolConfig = parsePromptToolConfig(prompt?.config);
+        if (hasPromptToolStructuredOutputConflict(toolConfig, true)) {
+          throw new InvalidRequestError(
+            PROMPT_TOOL_STRUCTURED_OUTPUT_CONFLICT_MESSAGE,
+          );
+        }
+      }
 
       if (!redis) {
         throw new UnauthorizedError("Experiment creation failed");
@@ -308,14 +331,63 @@ export const experimentsRouter = createTRPCRouter({
       };
     }),
 
-  byId: protectedProjectProcedure
+  /**
+   * The most recent runs regardless of the selected time range, for the empty
+   * window on the experiments list ("if there's nothing in the last X days, I
+   * still want to see the last ones"). Same scoping and filters as `all`, only
+   * the start-time bounds are replaced.
+   */
+  mostRecent: protectedProjectProcedure
     .input(
+      z.object({
+        projectId: z.string(),
+        filter: singleFilterList.nullable(),
+        limit: z.number().int().min(1).max(50),
+      }),
+    )
+    .query(async ({ input, ctx }) => {
+      throwIfNoProjectAccess({
+        session: ctx.session,
+        projectId: input.projectId,
+        scope: "promptExperiments:read",
+      });
+
+      // Return the server-resolved window so widgets share it without adding
+      // a render-time timestamp to the fallback query input.
+      const to = new Date();
+      const from = addDays(to, -MOST_RECENT_LOOKBACK_DAYS);
+      const filter: FilterState = [
+        // The selected window is the one that came back empty; every other
+        // filter the user applied still holds.
+        ...(input.filter ?? []).filter((f) => f.column !== "startTime"),
+        {
+          column: "startTime",
+          type: "datetime",
+          operator: ">=",
+          value: from,
+        },
+      ];
+
+      const experiments = await getExperimentsFromEvents({
+        projectId: input.projectId,
+        filter,
+        orderBy: { column: "startTime", order: "DESC" },
+        page: 0,
+        limit: input.limit,
+      });
+
+      return { data: experiments, dateRange: { from, to } };
+    }),
+
+  byId: auditedQuery(
+    protectedProjectProcedure.input(
       z.object({
         projectId: z.string(),
         experimentId: z.string(),
       }),
-    )
-    .query(async ({ input, ctx }) => {
+    ),
+    { resourceType: "experiment", action: "read", idKey: "experimentId" },
+    async ({ input, ctx }) => {
       throwIfNoProjectAccess({
         session: ctx.session,
         projectId: input.projectId,
@@ -342,13 +414,14 @@ export const experimentsRouter = createTRPCRouter({
       }
 
       return experiments[0];
-    }),
+    },
+  ),
 
   countAll: protectedProjectProcedure
     .input(
       z.object({
         projectId: z.string(),
-        filter: z.array(singleFilter).nullable(),
+        filter: singleFilterList.nullable(),
       }),
     )
     .query(async ({ input, ctx }) => {
@@ -373,7 +446,7 @@ export const experimentsRouter = createTRPCRouter({
       z.object({
         projectId: z.string(),
         experimentIds: z.array(z.string()),
-        filter: z.array(singleFilter).nullable(),
+        filter: singleFilterList.nullable(),
       }),
     )
     .query(async ({ input, ctx }) => {
@@ -453,21 +526,86 @@ export const experimentsRouter = createTRPCRouter({
             }))
           : [];
 
-      const [numericScoreNames, categoricalScoreNames, experimentDatasetIds] =
-        await Promise.all([
-          getNumericScoresGroupedByName(
-            input.projectId,
-            traceTimestampFilters ?? [],
-          ),
-          getCategoricalScoresGroupedByName(
-            input.projectId,
-            traceTimestampFilters ?? [],
-          ),
-          getEventsGroupedByExperimentDatasetId(
-            input.projectId,
-            input.startTimeFilter ?? [],
-          ),
-        ]);
+      // Offered-set == matchable-set: the level-agnostic score filters match a
+      // score only if it rolls up into a trace, so discovery is scoped the same
+      // way. Session- and dataset-run scores can never match, and offering them
+      // would advertise a filter that cannot fire.
+      const nullCondition = (
+        column: "traceId" | "observationId",
+        operator: "is null" | "is not null",
+      ) => ({ type: "null" as const, column, operator, value: "" as const });
+      const traceScopedFilter = [
+        nullCondition("traceId", "is not null"),
+        ...(traceTimestampFilters ?? []),
+      ];
+      // Discovered per level as well, to tag each offered name with the level(s)
+      // it exists at rather than duplicating the facets per level.
+      const observationScopedFilter = [
+        ...traceScopedFilter,
+        nullCondition("observationId", "is not null"),
+      ];
+      const traceLevelScopedFilter = [
+        ...traceScopedFilter,
+        nullCondition("observationId", "is null"),
+      ];
+
+      const [
+        numericScoreNames,
+        categoricalScoreNames,
+        booleanScoreNames,
+        observationLevelNumeric,
+        observationLevelCategorical,
+        observationLevelBoolean,
+        traceLevelNumeric,
+        traceLevelCategorical,
+        traceLevelBoolean,
+        experimentDatasetIds,
+      ] = await Promise.all([
+        getNumericScoresGroupedByName(input.projectId, traceScopedFilter),
+        getCategoricalScoresGroupedByName(input.projectId, traceScopedFilter),
+        getBooleanScoresGroupedByName(input.projectId, traceScopedFilter),
+        getNumericScoresGroupedByName(input.projectId, observationScopedFilter),
+        getCategoricalScoresGroupedByName(
+          input.projectId,
+          observationScopedFilter,
+        ),
+        getBooleanScoresGroupedByName(input.projectId, observationScopedFilter),
+        getNumericScoresGroupedByName(input.projectId, traceLevelScopedFilter),
+        getCategoricalScoresGroupedByName(
+          input.projectId,
+          traceLevelScopedFilter,
+        ),
+        getBooleanScoresGroupedByName(input.projectId, traceLevelScopedFilter),
+        getEventsGroupedByExperimentDatasetId(
+          input.projectId,
+          input.startTimeFilter ?? [],
+        ),
+      ]);
+
+      /**
+       * Split per data type: a name can be reused across types at different
+       * levels (a numeric observation-level "accuracy" beside an unrelated
+       * categorical trace-level one), and a name-only map would mislabel both.
+       */
+      const levelsOf = (
+        observationNames: string[],
+        traceNames: string[],
+      ): Record<string, ("observation" | "trace")[]> => {
+        const out: Record<string, ("observation" | "trace")[]> = {};
+        for (const name of observationNames) {
+          if (out[name] === undefined) {
+            out[name] = [];
+          }
+          out[name].push("observation");
+        }
+        for (const name of traceNames) {
+          if (out[name] === undefined) {
+            out[name] = [];
+          }
+          out[name].push("trace");
+        }
+        return out;
+      };
 
       const experimentDatasetIdSet = new Set<string>();
       for (const { experimentDatasetId } of experimentDatasetIds) {
@@ -479,20 +617,32 @@ export const experimentsRouter = createTRPCRouter({
       // Return score options for both observation-level and trace-level filters
       // The same score names are available at both levels
       const numericScoreOptions = numericScoreNames.map((score) => score.name);
+      const booleanScoreOptions = booleanScoreNames.map((score) => score.name);
 
       return {
-        // Observation-level score options (eos.*)
-        obs_scores_avg: numericScoreOptions,
-        obs_score_categories: categoricalScoreNames,
-        // Trace-level score options (ets.*)
-        trace_scores_avg: numericScoreOptions,
-        trace_score_categories: categoricalScoreNames,
+        // What the three score facets offer, with the level(s) each name exists
+        // at so the picker can tag them.
+        scores_avg: numericScoreOptions,
+        score_categories: categoricalScoreNames,
+        score_booleans: booleanScoreOptions,
+        score_name_levels_numeric: levelsOf(
+          observationLevelNumeric.map((score) => score.name),
+          traceLevelNumeric.map((score) => score.name),
+        ),
+        score_name_levels_categorical: levelsOf(
+          observationLevelCategorical.map((score) => score.label),
+          traceLevelCategorical.map((score) => score.label),
+        ),
+        score_name_levels_boolean: levelsOf(
+          observationLevelBoolean.map((score) => score.name),
+          traceLevelBoolean.map((score) => score.name),
+        ),
         experimentDatasetIds: Array.from(experimentDatasetIdSet),
       };
     }),
 
-  items: protectedProjectProcedure
-    .input(
+  items: auditedQuery(
+    protectedProjectProcedure.input(
       z.object({
         projectId: z.string(),
         baseExperimentId: z.string().nullish(),
@@ -501,7 +651,7 @@ export const experimentsRouter = createTRPCRouter({
           .array(
             z.object({
               experimentId: z.string(),
-              filters: z.array(singleFilter),
+              filters: singleFilterList,
             }),
           )
           .nullish(),
@@ -512,8 +662,9 @@ export const experimentsRouter = createTRPCRouter({
           .default("baseline-only"),
         ...paginationZod,
       }),
-    )
-    .query(async ({ input, ctx }) => {
+    ),
+    { resourceType: "experiment", action: "list" },
+    async ({ input, ctx, audit }) => {
       throwIfNoProjectAccess({
         session: ctx.session,
         projectId: input.projectId,
@@ -549,6 +700,7 @@ export const experimentsRouter = createTRPCRouter({
           observationIds,
           excludeMetadata: true,
           includeHasMetadata: true,
+          preferredClickhouseService: "ReadOnly",
         }),
         getScoresForTraces({
           projectId: input.projectId,
@@ -563,13 +715,15 @@ export const experimentsRouter = createTRPCRouter({
         scores: observationScores,
         dataTypes: AGGREGATABLE_SCORE_TYPES,
         includeHasMetadata: true,
-        onParseError: traceException,
+        onParseError: (error) =>
+          logger.warn("Invalid score omitted from response", { error }),
       });
       const validatedTraceScores = filterAndValidateDbScoreList({
         scores: traceScores,
         dataTypes: AGGREGATABLE_SCORE_TYPES,
         includeHasMetadata: true,
-        onParseError: traceException,
+        onParseError: (error) =>
+          logger.warn("Invalid score omitted from response", { error }),
       });
 
       const scoresByObservationId = new Map<
@@ -600,6 +754,15 @@ export const experimentsRouter = createTRPCRouter({
         }
       }
 
+      audit.refs(
+        items.flatMap((item) =>
+          item.experiments.flatMap((run) => [
+            ref("observation", run.observationId),
+            ref("trace", run.traceId),
+          ]),
+        ),
+      );
+      audit.count(items.length);
       return {
         data: items.map(({ itemId, experiments }) => ({
           itemId,
@@ -628,7 +791,8 @@ export const experimentsRouter = createTRPCRouter({
           ),
         })),
       };
-    }),
+    },
+  ),
 
   itemsCount: protectedProjectProcedure
     .input(
@@ -640,7 +804,7 @@ export const experimentsRouter = createTRPCRouter({
           .array(
             z.object({
               experimentId: z.string(),
-              filters: z.array(singleFilter),
+              filters: singleFilterList,
             }),
           )
           .nullish(),
@@ -672,16 +836,58 @@ export const experimentsRouter = createTRPCRouter({
       };
     }),
 
-  batchIO: protectedProjectProcedure
+  itemsFilterOptions: protectedProjectProcedure
     .input(
+      z.object({
+        projectId: z.string(),
+        experimentIds: z.array(z.string()).min(1),
+      }),
+    )
+    .query(async ({ input, ctx }) => {
+      throwIfNoProjectAccess({
+        session: ctx.session,
+        projectId: input.projectId,
+        scope: "promptExperiments:read",
+      });
+
+      return getExperimentItemsFilterOptions({
+        projectId: input.projectId,
+        experimentIds: input.experimentIds,
+      });
+    }),
+
+  scoreOptions: protectedProjectProcedure
+    .input(
+      z.object({
+        projectId: z.string(),
+        experimentIds: z.array(z.string()).min(1),
+      }),
+    )
+    .query(async ({ input, ctx }) => {
+      throwIfNoProjectAccess({
+        session: ctx.session,
+        projectId: input.projectId,
+        scope: "promptExperiments:read",
+      });
+
+      return getExperimentScoreOptions({
+        projectId: input.projectId,
+        experimentIds: input.experimentIds,
+      });
+    }),
+
+  batchIO: auditedQuery(
+    protectedProjectProcedure.input(
       z.object({
         projectId: z.string(),
         itemIds: z.array(z.string()),
         baseExperimentId: z.string().nullish(),
         compExperimentIds: z.array(z.string()),
+        ioCharLimit: z.number().int().positive().max(10_000).optional(),
       }),
-    )
-    .query(async ({ input, ctx }) => {
+    ),
+    { resourceType: "experiment", action: "read" },
+    async ({ input, ctx, audit }) => {
       throwIfNoProjectAccess({
         session: ctx.session,
         projectId: input.projectId,
@@ -697,10 +903,21 @@ export const experimentsRouter = createTRPCRouter({
         itemIds: input.itemIds,
         baseExperimentId: input.baseExperimentId ?? undefined,
         compExperimentIds: input.compExperimentIds,
+        ioCharLimit: input.ioCharLimit,
       });
 
+      audit.refs(
+        batchIO.flatMap((item) =>
+          item.outputs.flatMap((run) => [
+            ref("observation", run.observationId),
+            ref("trace", run.traceId),
+          ]),
+        ),
+      );
+      audit.count(batchIO.length);
       return batchIO;
-    }),
+    },
+  ),
 
   byProjectId: protectedProjectProcedure
     .input(
@@ -719,6 +936,34 @@ export const experimentsRouter = createTRPCRouter({
         projectId: input.projectId,
       });
 
-      return { experimentNames: experiments };
+      // Dataset names live in Postgres only — ClickHouse carries the id — so the
+      // display name is resolved here rather than in the projection, and the
+      // pickers never have to render a raw dataset id.
+      const datasetIds = [
+        ...new Set(
+          experiments
+            .map((experiment) => experiment.datasetId)
+            .filter((datasetId): datasetId is string => Boolean(datasetId)),
+        ),
+      ];
+      const datasets = datasetIds.length
+        ? await ctx.prisma.dataset.findMany({
+            where: { projectId: input.projectId, id: { in: datasetIds } },
+            select: { id: true, name: true },
+          })
+        : [];
+      const datasetNameById = new Map(datasets.map((d) => [d.id, d.name]));
+
+      return {
+        experimentNames: experiments.map((experiment) => ({
+          experimentId: experiment.experimentId,
+          experimentName: experiment.experimentName,
+          startTime: experiment.startTime,
+          datasetId: experiment.datasetId,
+          datasetName: experiment.datasetId
+            ? (datasetNameById.get(experiment.datasetId) ?? null)
+            : null,
+        })),
+      };
     }),
 });

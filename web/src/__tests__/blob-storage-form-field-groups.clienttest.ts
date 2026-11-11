@@ -11,7 +11,13 @@ import {
   BlobStorageExportMode,
   BlobStorageIntegrationFileType,
   BlobStorageIntegrationType,
+  EXPORT_FIELD_GROUP_OPTIONS,
+  type ExportSourceContext,
 } from "@langfuse/shared";
+import {
+  buildBlobStorageFormValues,
+  toStoredFieldGroups,
+} from "@/src/features/blobstorage-integration/components/formValues";
 
 const VALID_BASE: BlobStorageIntegrationFormSchema = {
   type: BlobStorageIntegrationType.S3,
@@ -41,6 +47,9 @@ describe("blob storage form — exportFieldGroups validation", () => {
       AnalyticsIntegrationExportSource.TRACES_OBSERVATIONS_EVENTS,
       ["basic", "io"],
     ],
+    [AnalyticsIntegrationExportSource.TRACES_OBSERVATIONS, []],
+    [AnalyticsIntegrationExportSource.TRACES_OBSERVATIONS, ["basic", "io"]],
+    [AnalyticsIntegrationExportSource.EVENTS, ["score_metadata"]],
   ] as const)(
     "blocks submission when exportSource is %s and core is absent (groups: %s)",
     async (source, exportFieldGroups) => {
@@ -64,14 +73,14 @@ describe("blob storage form — exportFieldGroups validation", () => {
     },
   );
 
-  it("allows submission when exportSource is TRACES_OBSERVATIONS regardless of exportFieldGroups", async () => {
+  it("allows submission when exportSource is TRACES_OBSERVATIONS and core is included", async () => {
     const { result } = renderHook(() =>
       useForm({
         resolver: zodResolver(blobStorageIntegrationFormSchema),
         defaultValues: {
           ...VALID_BASE,
           exportSource: AnalyticsIntegrationExportSource.TRACES_OBSERVATIONS,
-          exportFieldGroups: [],
+          exportFieldGroups: ["core", "io"],
         },
       }),
     );
@@ -82,5 +91,140 @@ describe("blob storage form — exportFieldGroups validation", () => {
     });
 
     expect(onSubmit).toHaveBeenCalledOnce();
+  });
+
+  it("allows submission with score groups next to observation groups", async () => {
+    const { result } = renderHook(() =>
+      useForm({
+        resolver: zodResolver(blobStorageIntegrationFormSchema),
+        defaultValues: {
+          ...VALID_BASE,
+          exportFieldGroups: ["core", "score_metadata"],
+        },
+      }),
+    );
+
+    const onSubmit = vi.fn();
+    await act(async () => {
+      await result.current.handleSubmit(onSubmit)();
+    });
+
+    expect(onSubmit).toHaveBeenCalledOnce();
+  });
+});
+
+describe("EXPORT_FIELD_GROUP_OPTIONS — parquet description", () => {
+  const PRICE_FIELDS = ["input_price", "output_price", "total_price"];
+  const model = EXPORT_FIELD_GROUP_OPTIONS.find((o) => o.value === "model")!;
+
+  it("model group lists price columns in the standard description", () => {
+    expect(PRICE_FIELDS.every((f) => model.description.includes(f))).toBe(true);
+  });
+
+  it("model group drops price columns in the parquet description", () => {
+    expect(PRICE_FIELDS.some((f) => model.parquetDescription.includes(f))).toBe(
+      false,
+    );
+    // Non-price model columns are preserved.
+    expect(model.parquetDescription).toContain("provided_model_name");
+  });
+
+  it("non-model groups have identical standard and parquet descriptions", () => {
+    for (const option of EXPORT_FIELD_GROUP_OPTIONS) {
+      if (option.value === "model") continue;
+      expect(option.parquetDescription).toBe(option.description);
+    }
+  });
+
+  it("legacy parquet drops prices and uses the narrower legacy schema", () => {
+    const basic = EXPORT_FIELD_GROUP_OPTIONS.find((o) => o.value === "basic")!;
+    const traceContext = EXPORT_FIELD_GROUP_OPTIONS.find(
+      (o) => o.value === "trace_context",
+    )!;
+
+    // No price columns (parquet runs no enrichment) — unlike legacyDescription.
+    expect(
+      PRICE_FIELDS.some((f) => model.legacyParquetDescription.includes(f)),
+    ).toBe(false);
+    expect(PRICE_FIELDS.some((f) => model.legacyDescription.includes(f))).toBe(
+      true,
+    );
+
+    // Enriched-only columns are absent from the legacy schema.
+    expect(basic.parquetDescription).toContain("bookmarked");
+    expect(basic.legacyParquetDescription).not.toContain("bookmarked");
+    expect(traceContext.parquetDescription).toContain("trace_name");
+    expect(traceContext.legacyParquetDescription).toBe(
+      "Not included in the legacy observations export",
+    );
+  });
+
+  it("flags groups without legacy observation columns so the UI can hide them for legacy-only exports", () => {
+    for (const option of EXPORT_FIELD_GROUP_OPTIONS) {
+      expect(option.includedInLegacyExport).toBe(
+        option.value !== "trace_context",
+      );
+    }
+  });
+});
+
+describe("buildBlobStorageFormValues — trace field groups", () => {
+  const ctx: ExportSourceContext = {
+    isCloud: false,
+    enrichedAvailable: true,
+    legacyWritesActive: true,
+  };
+
+  it.each([
+    // no stored trace group = full traces export, so every trace group is shown
+    [
+      ["core", "io"],
+      ["core", "io", "trace_core", "trace_io", "trace_metadata"],
+    ],
+    [
+      ["core", "trace_core"],
+      ["core", "trace_core"],
+    ],
+    // trace_core is locked in the form and kept once any trace group is stored
+    [
+      ["core", "trace_io"],
+      ["core", "trace_io", "trace_core"],
+    ],
+  ])("maps stored groups %j to form groups %j", (stored, expected) => {
+    const values = buildBlobStorageFormValues(
+      { exportFieldGroups: stored },
+      ctx,
+    );
+    expect(values.exportFieldGroups).toEqual(expected);
+  });
+});
+
+describe("toStoredFieldGroups", () => {
+  const ctx: ExportSourceContext = {
+    isCloud: false,
+    enrichedAvailable: true,
+    legacyWritesActive: true,
+  };
+
+  it.each([
+    // an untouched save stores the same list it loaded (no trace groups)
+    [
+      ["core", "io"],
+      ["core", "io"],
+    ],
+    [
+      ["core", "trace_core"],
+      ["core", "trace_core"],
+    ],
+    [
+      ["core", "trace_core", "trace_io"],
+      ["core", "trace_core", "trace_io"],
+    ],
+  ])("round-trips stored groups %j as %j", (stored, expected) => {
+    const formGroups = buildBlobStorageFormValues(
+      { exportFieldGroups: stored },
+      ctx,
+    ).exportFieldGroups;
+    expect(toStoredFieldGroups(formGroups ?? [])).toEqual(expected);
   });
 });

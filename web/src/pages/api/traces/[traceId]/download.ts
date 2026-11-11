@@ -1,4 +1,10 @@
-import { InvalidRequestError, UnauthorizedError } from "@langfuse/shared";
+import {
+  InvalidRequestError,
+  toAuditLogResourceRef,
+  UnauthorizedError,
+} from "@langfuse/shared";
+import { stringify } from "@langfuse/shared/src/server";
+import { recordInternalApiAccess } from "@/src/features/audit-logs/server/recordAccessEvent";
 import { withMiddlewares } from "@/src/features/public-api/server/withMiddlewares";
 import {
   buildTraceExport,
@@ -32,7 +38,6 @@ function getTraceExportSession(
   return {
     user: {
       email: user.email,
-      admin: user.admin,
       organizations: user.organizations,
     },
   };
@@ -42,9 +47,8 @@ const buildDownloadFilename = (traceId: string) => `trace-${traceId}.json`;
 
 export default withMiddlewares({
   GET: async (req, res) => {
-    const session = getTraceExportSession(
-      await getServerAuthSession({ req, res }),
-    );
+    const authSession = await getServerAuthSession({ req, res });
+    const session = getTraceExportSession(authSession);
 
     const result = querySchema.safeParse({
       traceId: req.query.traceId,
@@ -60,6 +64,20 @@ export default withMiddlewares({
       session,
     });
 
+    await recordInternalApiAccess(
+      { session: authSession, req },
+      result.data.projectId,
+      {
+        route: "GET /api/traces/{traceId}/download",
+        resourceType: "trace",
+        resourceId: result.data.traceId,
+        action: "download",
+        resourceRefs: [toAuditLogResourceRef("trace", result.data.traceId)],
+        params: { ...result.data, destination: "download" },
+        resultCount: payload.observations.length + payload.scores.length,
+      },
+    );
+
     res.setHeader("Content-Type", "application/json; charset=utf-8");
     const downloadFilename = buildDownloadFilename(result.data.traceId);
     res.setHeader(
@@ -67,6 +85,10 @@ export default withMiddlewares({
       `attachment; filename="trace-export.json"; filename*=UTF-8''${encodeURIComponent(downloadFilename)}`,
     );
 
-    return res.status(200).send(JSON.stringify(payload, null, 2));
+    // Use the shared stringify helper (not the raw JSON.stringify) so that
+    // \uXXXX escapes in string fields (e.g. Japanese ingested with Python
+    // ensure_ascii=True) are decoded to real characters. Pass indent=2 to keep
+    // the download human-readable, matching the previous pretty-printed output.
+    return res.status(200).send(stringify(payload, undefined, 2));
   },
 });

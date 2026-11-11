@@ -1,6 +1,27 @@
-import { formatMetric } from "@/src/features/widgets/chart-library/utils";
+// @vitest-environment node
+
+import {
+  formatMetric,
+  getDimensionSummaries,
+  getEvenTickInterval,
+  toFullMetricString,
+} from "@/src/features/widgets/chart-library/utils";
+import { type DataPoint } from "@/src/features/widgets/chart-library/chart-props";
 
 describe("formatMetric", () => {
+  it("keeps sub-millisecond duration ticks distinct", () => {
+    expect(
+      [0, 0.002, 0.004, 0.006, 0.008, 0.01].map((value) =>
+        formatMetric(value, { unit: "milliseconds", style: "compact" }),
+      ),
+    ).toEqual(
+      ["0", "0.002", "0.004", "0.006", "0.008", "0.01"].map((main) => ({
+        main,
+        suffix: "ms",
+      })),
+    );
+  });
+
   it("keeps compact numeric formatting within maxCharacters", () => {
     expect(
       formatMetric(12_345, { style: "compact", maxCharacters: 4 }),
@@ -74,6 +95,28 @@ describe("formatMetric", () => {
     });
   });
 
+  it("rounds USD to cents and floors tiny non-zero values when opted in", () => {
+    const usd = (value: number, style: "compact" | "full") =>
+      toFullMetricString(
+        formatMetric(value, { unit: "USD", style, usdPrecision: "cents" }),
+      );
+
+    for (const style of ["compact", "full"] as const) {
+      expect(usd(2.036571, style)).toBe("$2.04");
+      expect(usd(0.5, style)).toBe("$0.50");
+      expect(usd(1234.5, style)).toBe("$1,234.50");
+      expect(usd(0.004, style)).toBe("<$0.01");
+      expect(usd(0.0000001, style)).toBe("<$0.01");
+      expect(usd(0, style)).toBe("$0.00");
+    }
+  });
+
+  it("keeps sub-cent USD precision by default", () => {
+    expect(
+      toFullMetricString(formatMetric(0.0023, { unit: "USD", style: "full" })),
+    ).toBe("$0.0023");
+  });
+
   it("keeps negative currency sign ahead of the currency prefix", () => {
     expect(formatMetric(-1.234567, { unit: "USD", style: "compact" })).toEqual({
       negative: true,
@@ -92,7 +135,7 @@ describe("formatMetric", () => {
   it("trims duration precision to fit maxCharacters", () => {
     expect(
       formatMetric(1_500, {
-        unit: "millisecond",
+        unit: "milliseconds",
         style: "compact",
         maxCharacters: 3,
       }),
@@ -191,5 +234,87 @@ describe("formatMetric", () => {
     expect(formatMetric(0.00012, { style: "full", maxCharacters: 7 })).toEqual({
       main: "1.20e-4",
     });
+  });
+});
+
+describe("getDimensionSummaries", () => {
+  const point = (
+    time_dimension: string,
+    dimension: string | undefined,
+    metric: DataPoint["metric"],
+  ): DataPoint => ({ time_dimension, dimension, metric });
+
+  it("sums numeric values per series", () => {
+    const summaries = getDimensionSummaries([
+      point("t1", "service_a", 2),
+      point("t2", "service_a", 3),
+      point("t1", "service_b", 10),
+    ]);
+
+    expect(summaries.get("service_a")).toBe(5);
+    expect(summaries.get("service_b")).toBe(10);
+  });
+
+  it("treats 0 as a real value, not as missing data (LFE-10498)", () => {
+    const summaries = getDimensionSummaries([
+      point("t1", "service_c", 0),
+      point("t2", "service_c", 0),
+    ]);
+
+    // A series whose data sums to 0 must keep its 0 summary, not be dropped.
+    expect(summaries.get("service_c")).toBe(0);
+  });
+
+  it("reports series with no real data point as null, not 0 (LFE-10498)", () => {
+    const summaries = getDimensionSummaries([
+      // NaN/Infinity are not real data; the series has no finite metric.
+      point("t1", "service_missing", NaN),
+      point("t2", "service_missing", Infinity),
+    ]);
+
+    expect(summaries.get("service_missing")).toBeNull();
+  });
+
+  it("does not invent a value for a series that has data alongside non-finite points", () => {
+    const summaries = getDimensionSummaries([
+      point("t1", "service_a", NaN),
+      point("t2", "service_a", 4),
+    ]);
+
+    // The single finite point counts; the NaN is ignored.
+    expect(summaries.get("service_a")).toBe(4);
+  });
+
+  it("ignores the histogram tuple metric shape and rows without a dimension", () => {
+    const summaries = getDimensionSummaries([
+      point("t1", undefined, 5),
+      point("t1", "histo", [
+        [0, 1],
+        [1, 2],
+      ]),
+    ]);
+
+    expect(summaries.has("")).toBe(false);
+    expect(summaries.get("histo")).toBeNull();
+  });
+});
+
+describe("getEvenTickInterval", () => {
+  it("shows every tick when the point count fits the target", () => {
+    expect(getEvenTickInterval(7)).toBe(0);
+    expect(getEvenTickInterval(8)).toBe(0);
+    expect(getEvenTickInterval(0)).toBe(0);
+  });
+
+  it("skips ticks evenly past the target so gaps stay uniform", () => {
+    // 14 daily points -> show every 2nd (6/1, 6/3, … — no width-dependent drop).
+    expect(getEvenTickInterval(14)).toBe(1);
+    expect(getEvenTickInterval(9)).toBe(1);
+    expect(getEvenTickInterval(30)).toBe(3);
+  });
+
+  it("honors a custom max tick target", () => {
+    expect(getEvenTickInterval(12, 6)).toBe(1);
+    expect(getEvenTickInterval(6, 6)).toBe(0);
   });
 });

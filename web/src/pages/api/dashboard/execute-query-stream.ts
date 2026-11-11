@@ -6,13 +6,12 @@ import {
   isException,
   ClickHouseResourceError,
   queryClickhouseWithProgress,
+  logger,
 } from "@langfuse/shared/src/server";
 import { RESOURCE_LIMIT_ERROR_MESSAGE } from "@langfuse/shared";
-import { logger } from "@langfuse/shared/src/server";
 
 import { getServerAuthSession } from "@/src/server/auth";
 import { sendAdminAccessWebhook } from "@/src/server/adminAccessWebhook";
-import { prisma } from "@langfuse/shared/src/db";
 import {
   prepareExecuteQuery,
   toClickhouseQueryOpts,
@@ -41,10 +40,12 @@ function formatSSEEvent(event: SSEEvent): string {
   }
 }
 
+// `version` is required on purpose — see dashboard.executeQuery: an implicit
+// v1 default let unresolved-session clients silently pick the read path.
 const inputSchema = z.object({
   projectId: z.string(),
   query: customQuery,
-  version: viewVersions.optional().default("v1"),
+  version: viewVersions,
 });
 
 export default async function handler(
@@ -79,25 +80,11 @@ export default async function handler(
     .find((project) => project.id === projectId);
 
   if (!sessionProject) {
-    if (session.user.admin === true) {
-      const dbProject = await prisma.project.findFirst({
-        select: { orgId: true },
-        where: { id: projectId, deletedAt: null },
-      });
-      if (!dbProject) {
-        res.status(404).json({ message: "Project not found" });
-        return;
-      }
-      await sendAdminAccessWebhook({
-        email: session.user.email,
-        projectId,
-        orgId: dbProject.orgId,
-      });
-    } else {
-      res.status(403).json({ message: "Not a member of this project" });
-      return;
-    }
-  } else if (session.user.admin === true) {
+    res.status(403).json({ message: "Not a member of this project" });
+    return;
+  }
+
+  if (sessionProject.organization.supportAccess === true) {
     await sendAdminAccessWebhook({
       email: session.user.email,
       projectId,
@@ -127,10 +114,18 @@ export default async function handler(
   });
   res.flushHeaders();
 
-  let aborted = false;
-  req.on("close", () => {
-    aborted = true;
-  });
+  // A closed client should also stop the ClickHouse query, not just this
+  // response: aborting the signal tears down the CH request (and counts the
+  // query as client_closed), and cancel_http_readonly_queries_on_client_close
+  // makes ClickHouse kill the query on that close instead of running the
+  // abandoned aggregation to completion. max_execution_time still bounds the
+  // stragglers either way.
+  const clientClosed = new AbortController();
+  // `res`, not `req`: the request stream can end once the POST body is
+  // consumed, while the response lives for the whole stream — its close
+  // fires on a client disconnect mid-stream (and only after res.end() on
+  // the happy path, where the loop has already finished).
+  res.on("close", () => clientClosed.abort());
 
   try {
     const prepared = await prepareExecuteQuery({
@@ -143,9 +138,19 @@ export default async function handler(
 
     for await (const event of queryClickhouseWithProgress<
       Record<string, unknown>
-    >(chOpts)) {
-      if (aborted) break;
-
+    >({
+      ...chOpts,
+      abortSignal: clientClosed.signal,
+      tags: {
+        ...chOpts.tags,
+        surface: "internalapi",
+        route: "POST /api/dashboard/execute-query-stream",
+      },
+      clickhouseSettings: {
+        ...chOpts.clickhouseSettings,
+        cancel_http_readonly_queries_on_client_close: 1,
+      },
+    })) {
       if (isProgressRow(event)) {
         res.write(
           formatSSEEvent({ type: "progress", progress: event.progress }),
@@ -169,21 +174,24 @@ export default async function handler(
       }
     }
 
-    if (!aborted) {
+    if (!clientClosed.signal.aborted) {
       res.write(formatSSEEvent({ type: "done" }));
     }
   } catch (error) {
-    if (!aborted) {
+    if (!clientClosed.signal.aborted) {
       logger.error("[execute-query-stream] Query failed", {
         error: error instanceof Error ? error.message : String(error),
         projectId,
       });
-      const message =
-        error instanceof ClickHouseResourceError
-          ? RESOURCE_LIMIT_ERROR_MESSAGE
-          : error instanceof Error
-            ? error.message
-            : "Internal server error";
+      const message = (() => {
+        if (error instanceof ClickHouseResourceError) {
+          return RESOURCE_LIMIT_ERROR_MESSAGE;
+        }
+        if (error instanceof Error) {
+          return error.message;
+        }
+        return "Internal server error";
+      })();
       res.write(formatSSEEvent({ type: "error", message }));
     }
   } finally {

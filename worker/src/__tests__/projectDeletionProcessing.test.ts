@@ -1,5 +1,5 @@
 import { expect, it, describe, beforeAll, beforeEach, afterEach } from "vitest";
-import { env } from "../env";
+import { env, v4WritesToEventsTable } from "../env";
 import { randomUUID } from "crypto";
 import {
   convertDateToClickhouseDateTime,
@@ -15,6 +15,7 @@ import {
   getTraceById,
   StorageService,
   StorageServiceFactory,
+  storageKeys,
   upsertTrace,
   deleteTracesByProjectId,
   deleteObservationsByProjectId,
@@ -34,13 +35,14 @@ describe("ProjectDeletionProcessingJob", () => {
   let s3Prefix: string | null = null;
   const orgId = "seed-org-id";
 
-  const maybeEventsIt =
-    env.LANGFUSE_EXPERIMENT_INSERT_INTO_EVENTS_TABLE === "true" ? it : it.skip;
+  const maybeEventsIt = v4WritesToEventsTable(env) ? it : it.skip;
 
   beforeAll(() => {
     storageService = StorageServiceFactory.getInstance({
-      accessKeyId: env.LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID,
-      secretAccessKey: env.LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY,
+      credentials: storageKeys(
+        env.LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID,
+        env.LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY,
+      ),
       bucketName: String(env.LANGFUSE_S3_MEDIA_UPLOAD_BUCKET),
       endpoint: env.LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT,
       region: env.LANGFUSE_S3_MEDIA_UPLOAD_REGION,
@@ -88,6 +90,7 @@ describe("ProjectDeletionProcessingJob", () => {
   it("should delete related table data via Prisma dependencies", async () => {
     // Setup
     const projectId = randomUUID();
+    const mediaId = randomUUID();
     await prisma.project.create({
       data: {
         id: projectId,
@@ -103,6 +106,27 @@ describe("ProjectDeletionProcessingJob", () => {
         name: "Dataset",
       },
     });
+    await Promise.all([
+      prisma.traceMedia.create({
+        data: {
+          id: randomUUID(),
+          projectId,
+          traceId: randomUUID(),
+          mediaId,
+          field: "input",
+        },
+      }),
+      prisma.observationMedia.create({
+        data: {
+          id: randomUUID(),
+          projectId,
+          traceId: randomUUID(),
+          observationId: randomUUID(),
+          mediaId,
+          field: "output",
+        },
+      }),
+    ]);
 
     // When
     await projectDeleteProcessor({
@@ -116,6 +140,12 @@ describe("ProjectDeletionProcessingJob", () => {
       },
     });
     expect(datasets).toHaveLength(0);
+    await expect(
+      prisma.traceMedia.findMany({ where: { projectId } }),
+    ).resolves.toHaveLength(0);
+    await expect(
+      prisma.observationMedia.findMany({ where: { projectId } }),
+    ).resolves.toHaveLength(0);
   });
 
   it("should delete clickhouse event data on project delete", async () => {
@@ -263,6 +293,29 @@ describe("ProjectDeletionProcessingJob", () => {
         field: "test",
       },
     });
+    await prisma.observationMedia.create({
+      data: {
+        id: randomUUID(),
+        projectId,
+        traceId,
+        observationId: randomUUID(),
+        mediaId,
+        field: "test",
+      },
+    });
+    await prisma.datasetItemMedia.create({
+      data: {
+        id: randomUUID(),
+        projectId,
+        datasetId: randomUUID(),
+        datasetItemId: randomUUID(),
+        datasetItemValidFrom: new Date(),
+        mediaId,
+        field: "input",
+        jsonPath: "$['image']",
+        referenceString: `@@@langfuseMedia:type=text/plain|id=${mediaId}|source=bytes@@@`,
+      },
+    });
 
     // When
     await projectDeleteProcessor({
@@ -282,6 +335,14 @@ describe("ProjectDeletionProcessingJob", () => {
       where: { mediaId },
     });
     expect(traceMedia).toBeNull();
+    const observationMedia = await prisma.observationMedia.findFirst({
+      where: { mediaId },
+    });
+    expect(observationMedia).toBeNull();
+    const datasetItemMedia = await prisma.datasetItemMedia.findFirst({
+      where: { mediaId },
+    });
+    expect(datasetItemMedia).toBeNull();
   });
 
   describe("delete functions with hasAny probe", () => {

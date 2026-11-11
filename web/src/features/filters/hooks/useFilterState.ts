@@ -1,3 +1,4 @@
+/* eslint-disable no-nested-ternary */
 import {
   type FilterState,
   type TableName,
@@ -10,8 +11,13 @@ import {
   datasetItemFilterColumns,
   datasetRunItemsTableCols,
   usersTableCols,
+  escapePipeInValue,
+  splitOnUnescapedPipe,
+  unescapePipeInValue,
+  normalizeLegacySessionPositionInTraceKey,
+  scoresTableCols,
 } from "@langfuse/shared";
-import { scoresTableCols } from "@/src/server/api/definitions/scoresTable";
+
 import {
   useQueryParam,
   encodeDelimitedArray,
@@ -23,13 +29,7 @@ import { evalConfigFilterColumns } from "@/src/server/api/definitions/evalConfig
 import { evalExecutionsFilterCols } from "@/src/server/api/definitions/evalExecutionsTable";
 import { experimentsTableCols } from "@/src/features/experiments/components/table/filter-config";
 import { experimentItemsTableCols } from "@/src/features/experiments/config/experiment-items-filter-config";
-import {
-  escapePipeInValue,
-  splitOnUnescapedPipe,
-  unescapePipeInValue,
-} from "../lib/filter-query-encoding";
-import { normalizeLegacySessionPositionInTraceKey } from "@/src/components/session/session-position-in-trace";
-import { usePeekTableState } from "@/src/components/table/peek/contexts/PeekTableStateContext";
+import { usePeekTableState } from "@/src/components/table/peek/contexts/PeekTableStateProvider";
 
 const DEBUG_QUERY_STATE = false;
 
@@ -50,9 +50,10 @@ const getCommaArrayParam = (table: TableName) => ({
           const stringified = `${columnId};${f.type};${
             f.type === "numberObject" ||
             f.type === "stringObject" ||
+            f.type === "booleanObject" ||
             f.type === "categoryOptions" ||
             f.type === "positionInTrace"
-              ? f.key
+              ? encodeURIComponent(f.key ?? "")
               : ""
           };${f.operator};${encodeURIComponent(
             f.type === "datetime"
@@ -83,31 +84,43 @@ const getCommaArrayParam = (table: TableName) => ({
 
         if (DEBUG_QUERY_STATE)
           console.log("values", [column, type, key, operator, value]);
-        const decodedValue = value ? decodeURIComponent(value) : undefined;
+        const decodedValue =
+          value !== undefined ? decodeURIComponent(value) : undefined;
         const normalizedKey =
           type === "positionInTrace"
-            ? normalizeLegacySessionPositionInTraceKey(key)
-            : key;
-        const parsedValue =
-          decodedValue === undefined || type === undefined
-            ? undefined
-            : type === "datetime"
-              ? new Date(decodedValue)
-              : type === "number" || type === "numberObject"
-                ? Number(decodedValue)
-                : type === "positionInTrace"
-                  ? decodedValue === ""
-                    ? undefined
-                    : Number(decodedValue)
-                  : type === "stringOptions" ||
-                      type === "arrayOptions" ||
-                      type === "categoryOptions"
-                    ? splitOnUnescapedPipe(decodedValue).map(
-                        unescapePipeInValue,
-                      )
-                    : type === "boolean"
-                      ? decodedValue === "true"
-                      : decodedValue;
+            ? normalizeLegacySessionPositionInTraceKey(decodeObjectKey(key))
+            : decodeObjectKey(key);
+        const parsedValue = (() => {
+          if (decodedValue === undefined || type === undefined) {
+            return undefined;
+          }
+          if (type === "datetime") {
+            return new Date(decodedValue);
+          }
+          if (type === "number" || type === "numberObject") {
+            return Number(decodedValue);
+          }
+          if (type === "positionInTrace") {
+            if (decodedValue === "") {
+              return undefined;
+            }
+            return Number(decodedValue);
+          }
+          if (type === "arrayOptions" && decodedValue === "") {
+            return [];
+          }
+          if (
+            type === "stringOptions" ||
+            type === "arrayOptions" ||
+            type === "categoryOptions"
+          ) {
+            return splitOnUnescapedPipe(decodedValue).map(unescapePipeInValue);
+          }
+          if (type === "boolean" || type === "booleanObject") {
+            return decodedValue === "true";
+          }
+          return decodedValue;
+        })();
 
         if (DEBUG_QUERY_STATE) console.log("parsedValue", parsedValue);
         const parsed = singleFilter.safeParse({
@@ -218,4 +231,14 @@ function getColumnId(table: TableName, name: string): string | undefined {
 
 function getColumnName(table: TableName, id: string): string | undefined {
   return tableCols[table]?.find((col) => col.id === id)?.name;
+}
+
+/** decodeObjectKey percent-decodes a filter key, keeping keys from older raw links as written */
+function decodeObjectKey(key: string | undefined): string | undefined {
+  if (key === undefined) return undefined;
+  try {
+    return decodeURIComponent(key);
+  } catch {
+    return key;
+  }
 }

@@ -11,7 +11,7 @@ import {
   FormMessage,
 } from "@/src/components/ui/form";
 import { Input } from "@/src/components/ui/input";
-import { api } from "@/src/utils/api";
+import { api, reportTrpcErrorWithoutToast } from "@/src/utils/api";
 import { useSession } from "next-auth/react";
 import { projectNameSchema } from "@/src/features/auth/lib/projectNameSchema";
 import { usePostHogClientCapture } from "@/src/features/posthog-analytics/usePostHogClientCapture";
@@ -34,7 +34,7 @@ export const NewProjectForm = ({
   });
   const createProjectMutation = api.projects.create.useMutation({
     onSuccess: () => {
-      void updateSession();
+      updateSession();
     },
     onError: (error) => form.setError("name", { message: error.message }),
   });
@@ -50,9 +50,7 @@ export const NewProjectForm = ({
         onSuccess(project.id);
         form.reset();
       })
-      .catch((error) => {
-        console.error(error);
-      });
+      .catch((error) => reportTrpcErrorWithoutToast(error, "projects"));
   }
   return (
     <Form {...form}>
@@ -63,7 +61,7 @@ export const NewProjectForm = ({
         onKeyDown={(e) => {
           if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
             e.preventDefault();
-            void form.handleSubmit(onSubmit)();
+            form.handleSubmit(onSubmit)();
           }
         }}
       >

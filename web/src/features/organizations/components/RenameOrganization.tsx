@@ -1,6 +1,7 @@
+import { useHasOrganizationAccess } from "@/src/features/rbac/utils/checkOrganizationAccess";
 import { Button } from "@/src/components/ui/button";
 import { Input } from "@/src/components/ui/input";
-import { api } from "@/src/utils/api";
+import { api, reportTrpcErrorWithoutToast } from "@/src/utils/api";
 import type * as z from "zod";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useForm } from "react-hook-form";
@@ -14,10 +15,9 @@ import {
 import { projectNameSchema } from "@/src/features/auth/lib/projectNameSchema";
 import Header from "@/src/components/layouts/header";
 import { usePostHogClientCapture } from "@/src/features/posthog-analytics/usePostHogClientCapture";
-import { useHasOrganizationAccess } from "@/src/features/rbac/utils/checkOrganizationAccess";
 import { useQueryOrganization } from "@/src/features/organizations/hooks";
 import { Card } from "@/src/components/ui/card";
-import { LockIcon } from "lucide-react";
+import { LockIcon } from "@langfuse/icons";
 import { useSession } from "next-auth/react";
 
 export default function RenameOrganization() {
@@ -40,7 +40,7 @@ export default function RenameOrganization() {
   });
   const renameOrganization = api.organizations.update.useMutation({
     onSuccess: () => {
-      void updateSession();
+      updateSession();
     },
     onError: (error) => form.setError("name", { message: error.message }),
   });
@@ -56,9 +56,7 @@ export default function RenameOrganization() {
       .then(() => {
         form.reset();
       })
-      .catch((error) => {
-        console.error(error);
-      });
+      .catch((error) => reportTrpcErrorWithoutToast(error, "organizations"));
   }
 
   return (
@@ -99,7 +97,10 @@ export default function RenameOrganization() {
                       />
                       {!hasAccess && (
                         <span title="No access">
-                          <LockIcon className="text-muted absolute top-1/2 right-3 h-4 w-4 -translate-y-1/2 transform" />
+                          <LockIcon
+                            size="base"
+                            __rawClassName="text-muted absolute top-1/2 right-3 -translate-y-1/2 transform"
+                          />
                         </span>
                       )}
                     </div>

@@ -83,8 +83,8 @@ describe("Mixpanel transformers", () => {
       const result = transformEventForMixpanel(event, projectId);
 
       expect(result.event).toBe("[Langfuse] Observation");
-      // distinct_id should be the generated $insert_id when no user_id
-      expect(result.properties.distinct_id).toBe(result.properties.$insert_id);
+      // distinct_id should be empty string for non-user events (Mixpanel distributes across shards)
+      expect(result.properties.distinct_id).toBe("");
       // Should not have $user_id for anonymous events
       expect(result.properties.$user_id).toBeUndefined();
       expect(result.properties.session_id).toBeUndefined();
@@ -184,7 +184,7 @@ describe("Mixpanel transformers", () => {
     ];
 
     it.each(badIds)(
-      "transformTraceForMixpanel falls back to insert_id when user_id is '%s'",
+      "transformTraceForMixpanel falls back to empty string distinct_id when user_id is '%s'",
       (badId) => {
         const trace: AnalyticsTraceEvent = {
           langfuse_id: "trace-bad-id",
@@ -199,15 +199,13 @@ describe("Mixpanel transformers", () => {
         };
 
         const result = transformTraceForMixpanel(trace, projectId);
-        expect(result.properties.distinct_id).toBe(
-          result.properties.$insert_id,
-        );
+        expect(result.properties.distinct_id).toBe("");
         expect(result.properties.$user_id).toBeUndefined();
       },
     );
 
     it.each(badIds)(
-      "transformGenerationForMixpanel falls back to insert_id when user_id is '%s'",
+      "transformGenerationForMixpanel falls back to empty string distinct_id when user_id is '%s'",
       (badId) => {
         const generation: AnalyticsGenerationEvent = {
           langfuse_id: "gen-bad-id",
@@ -224,15 +222,13 @@ describe("Mixpanel transformers", () => {
         };
 
         const result = transformGenerationForMixpanel(generation, projectId);
-        expect(result.properties.distinct_id).toBe(
-          result.properties.$insert_id,
-        );
+        expect(result.properties.distinct_id).toBe("");
         expect(result.properties.$user_id).toBeUndefined();
       },
     );
 
     it.each(badIds)(
-      "transformScoreForMixpanel falls back to insert_id when user_id is '%s'",
+      "transformScoreForMixpanel falls back to empty string distinct_id when user_id is '%s'",
       (badId) => {
         const score: AnalyticsScoreEvent = {
           langfuse_id: "score-bad-id",
@@ -252,15 +248,13 @@ describe("Mixpanel transformers", () => {
         };
 
         const result = transformScoreForMixpanel(score, projectId);
-        expect(result.properties.distinct_id).toBe(
-          result.properties.$insert_id,
-        );
+        expect(result.properties.distinct_id).toBe("");
         expect(result.properties.$user_id).toBeUndefined();
       },
     );
 
     it.each(badIds)(
-      "transformEventForMixpanel falls back to insert_id when user_id is '%s'",
+      "transformEventForMixpanel falls back to empty string distinct_id when user_id is '%s'",
       (badId) => {
         const event: AnalyticsObservationEvent = {
           langfuse_id: "event-bad-id",
@@ -275,9 +269,7 @@ describe("Mixpanel transformers", () => {
         };
 
         const result = transformEventForMixpanel(event, projectId);
-        expect(result.properties.distinct_id).toBe(
-          result.properties.$insert_id,
-        );
+        expect(result.properties.distinct_id).toBe("");
         expect(result.properties.$user_id).toBeUndefined();
       },
     );
@@ -412,6 +404,35 @@ describe("Mixpanel transformers", () => {
       expect(result.properties.session_id).toBe("mixpanel-session-789");
       expect(result.properties.langfuse_score_name).toBe("quality");
       expect(result.properties.langfuse_score_value).toBe(0.95);
+    });
+
+    it("truncates oversized metadata so Mixpanel's 1 MB event limit holds", () => {
+      const nested = JSON.stringify(
+        Array.from({ length: 20_000 }, (_, i) => ({
+          rule: `rule-${i}`,
+          ok: i,
+        })),
+      );
+      const score: AnalyticsScoreEvent = {
+        langfuse_id: "score-big",
+        timestamp: new Date("2026-10-24T17:57:18Z"),
+        langfuse_score_comment: "kept",
+        langfuse_score_metadata: { report: nested, again: nested },
+      };
+
+      const result = transformScoreForMixpanel(score, projectId);
+
+      expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThan(1_000_000);
+      const metadata = result.properties.langfuse_score_metadata as Record<
+        string,
+        string
+      >;
+      expect(metadata.report.endsWith("…[truncated]")).toBe(true);
+      expect(metadata.again).toBe(nested);
+      expect(result.properties.langfuse_score_truncated_fields).toEqual([
+        "langfuse_score_metadata.report",
+      ]);
+      expect(result.properties.langfuse_score_comment).toBe("kept");
     });
   });
 });

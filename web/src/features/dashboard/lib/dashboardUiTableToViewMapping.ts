@@ -1,10 +1,9 @@
-import { z } from "zod";
-import { singleFilter } from "@langfuse/shared";
+/* eslint-disable @typescript-eslint/no-use-before-define */
+import type { z } from "zod";
+import { singleFilterList } from "@langfuse/shared";
 import { type views } from "@langfuse/shared/query";
 
-// Exported to silence @typescript-eslint/no-unused-vars v8 warning
-// (used for type extraction via typeof, which is a legitimate pattern)
-export const FilterArray = z.array(singleFilter);
+export const FilterArray = singleFilterList;
 
 /**
  * Central compatibility layer for dashboard/widget filter columns.
@@ -58,20 +57,35 @@ const defineField = (
   legacy,
 });
 
+const evaluatorFilterDefinitions = [
+  defineField(
+    "evaluatorId",
+    sourceSpec("Evaluator", {
+      uiTableId: "evaluatorId",
+      aliases: ["Evaluator ID"],
+    }),
+  ),
+  defineField(
+    "isEvaluatorTest",
+    sourceSpec("Evaluator test run", {
+      uiTableId: "isEvaluatorTest",
+      aliases: ["Evaluator execution"],
+    }),
+  ),
+] as const;
+
 const viewFilterDefinitions: Record<
   ViewName,
   readonly DashboardViewFieldDefinition[]
 > = {
   traces: [
     defineField("name", sourceSpec("Trace Name", { uiTableId: "traceName" })),
-    defineField(
-      "observationName",
-      sourceSpec("Observation Name", { uiTableId: "observationName" }),
-    ),
-    defineField(
-      "scoreName",
-      sourceSpec("Score Name", { uiTableId: "scoreName" }),
-    ),
+    // observationName intentionally omitted: traces:observations is 1:n and traceView has no
+    // observationName dimension.
+    // scoreName intentionally omitted: traces:scores is 1:n, and traceView has
+    // no scoreName dimension.
+    // The legacy *Name->name fallback would silently rewrite this to traces.name.
+    // Filter on the scores-numeric / scores-categorical views instead.
     defineField("tags", sourceSpec("Tags", { uiTableId: "traceTags" })),
     defineField(
       "userId",
@@ -100,10 +114,8 @@ const viewFilterDefinitions: Record<
       "name",
       sourceSpec("Observation Name", { uiTableId: "observationName" }),
     ),
-    defineField(
-      "scoreName",
-      sourceSpec("Score Name", { uiTableId: "scoreName" }),
-    ),
+    // scoreName intentionally omitted: observations:scores is 1:n, and
+    // observationsView has no scoreName dimension. See LFE-9773.
     defineField(
       "userId",
       sourceSpec("User", { uiTableId: "user" }),
@@ -121,7 +133,20 @@ const viewFilterDefinitions: Record<
       "providedModelName",
       sourceSpec("Model", { uiTableId: "model" }),
     ),
-    defineField("level", sourceSpec("Level", { uiTableId: "level" })),
+    defineField(
+      "level",
+      sourceSpec("Status", { uiTableId: "level", aliases: ["Level"] }),
+    ),
+    defineField(
+      "skillNamesAvailable",
+      sourceSpec("Skill Names (Available)", {
+        uiTableId: "skillNamesAvailable",
+      }),
+    ),
+    defineField(
+      "skillsNamesLoaded",
+      sourceSpec("Skill Names (Loaded)", { uiTableId: "skillsNamesLoaded" }),
+    ),
     defineField(
       "toolNames",
       sourceSpec("Tool Names (Available)", { uiTableId: "toolNames" }),
@@ -148,11 +173,32 @@ const viewFilterDefinitions: Record<
       "environment",
       sourceSpec("Environment", { uiTableId: "environment" }),
     ),
+    ...evaluatorFilterDefinitions,
     defineField(
       "release",
-      sourceSpec("Observation Release", { uiTableId: "release" }),
+      sourceSpec("Release", {
+        uiTableId: "release",
+        aliases: ["Observation Release"],
+      }),
     ),
     defineField("version", sourceSpec("Version", { uiTableId: "version" })),
+    // Experiment fields (v2 only - experiment data only exists in events table)
+    defineField(
+      "experimentName",
+      sourceSpec("Experiment Name", { uiTableId: "experimentName" }),
+    ),
+    defineField(
+      "experimentDatasetId",
+      sourceSpec("Experiment Dataset", { uiTableId: "experimentDatasetId" }),
+    ),
+    defineField(
+      "experimentId",
+      sourceSpec("Experiment ID", { uiTableId: "experimentId" }),
+    ),
+    defineField(
+      "isRootObservation",
+      sourceSpec("Is Root Observation", { uiTableId: "isRootObservation" }),
+    ),
   ],
   "scores-numeric": [
     defineField("name", sourceSpec("Score Name", { uiTableId: "scoreName" })),
@@ -203,6 +249,55 @@ const viewFilterDefinitions: Record<
       "traceVersion",
       sourceSpec("Version", { uiTableId: "version" }),
     ),
+    ...evaluatorFilterDefinitions,
+  ],
+  "scores-boolean": [
+    defineField("name", sourceSpec("Score Name", { uiTableId: "scoreName" })),
+    defineField(
+      "source",
+      sourceSpec("Score Source", { uiTableId: "scoreSource" }),
+    ),
+    defineField(
+      "booleanValue",
+      sourceSpec("Boolean Value", { uiTableId: "booleanValue" }),
+    ),
+    defineField(
+      "dataType",
+      sourceSpec("Scores Data Type", { uiTableId: "scoreDataType" }),
+    ),
+    defineField("tags", sourceSpec("Tags", { uiTableId: "traceTags" })),
+    defineField(
+      "environment",
+      sourceSpec("Environment", { uiTableId: "environment" }),
+    ),
+    defineField(
+      "userId",
+      sourceSpec("User", { uiTableId: "user" }),
+      sourceSpec("User", { uiTableId: "userId" }),
+    ),
+    defineField(
+      "sessionId",
+      sourceSpec("Session", { uiTableId: "session" }),
+      sourceSpec("Session", { uiTableId: "sessionId" }),
+    ),
+    defineField("metadata", sourceSpec("Metadata", { uiTableId: "metadata" })),
+    defineField(
+      "traceName",
+      sourceSpec("Trace Name", { uiTableId: "traceName" }),
+    ),
+    defineField(
+      "observationName",
+      sourceSpec("Observation Name", { uiTableId: "observationName" }),
+    ),
+    defineField(
+      "traceRelease",
+      sourceSpec("Release", { uiTableId: "release" }),
+    ),
+    defineField(
+      "traceVersion",
+      sourceSpec("Version", { uiTableId: "version" }),
+    ),
+    ...evaluatorFilterDefinitions,
   ],
   "scores-categorical": [
     defineField("name", sourceSpec("Score Name", { uiTableId: "scoreName" })),
@@ -250,6 +345,7 @@ const viewFilterDefinitions: Record<
       "traceVersion",
       sourceSpec("Version", { uiTableId: "version" }),
     ),
+    ...evaluatorFilterDefinitions,
   ],
 };
 
@@ -274,6 +370,25 @@ const buildFilterMappings = (
 
 const currentWidgetFilterMappings = buildFilterMappings("current");
 const legacyDashboardFilterMappings = buildFilterMappings("legacy");
+
+export const getWidgetImportFilterConfig = (
+  view: z.infer<typeof views>,
+): {
+  allowedColumns: Set<string>;
+  columnAliases: Record<string, string>;
+} => {
+  const allowedColumns = new Set(
+    currentWidgetFilterMappings[view].map((mapping) => mapping.viewName),
+  );
+
+  const columnAliases: Record<string, string> = {};
+
+  if (view === "observations") {
+    columnAliases.observationModelName = "providedModelName";
+  }
+
+  return { allowedColumns, columnAliases };
+};
 
 const allWidgetFilterMappings = [
   ...Object.values(currentWidgetFilterMappings).flat(),
@@ -405,6 +520,13 @@ export const normalizeStoredWidgetFiltersForEditor = (
     unsupportedFilters: partitionedFilters.unsupportedFilters,
   };
 };
+
+/** displayNameForFilterColumn resolves any filter column spelling to the label the filter builder shows. */
+export const displayNameForFilterColumn = (column: string): string =>
+  allWidgetFilterMappings.find(
+    (mapping) =>
+      mapping.viewName === column || matchesFilterMapping(mapping, column),
+  )?.uiTableName ?? column;
 
 export const mapViewFilterToUiTableFilter = (
   view: z.infer<typeof views>,

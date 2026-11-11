@@ -9,6 +9,7 @@ import { throwIfNoOrganizationAccess } from "@/src/features/rbac/utils/checkOrga
 import { throwIfNoEntitlement } from "@/src/features/entitlements/server/hasEntitlement";
 import { paginationZod } from "@langfuse/shared";
 import { AuditLogRecordType, type AuditLog } from "@langfuse/shared/src/db";
+import { orgBoundApiKeyScopes } from "@langfuse/shared/src/server/auth/apiKeys";
 
 type AuditLogActor =
   | {
@@ -95,7 +96,7 @@ export const auditLogsRouter = createTRPCRouter({
       throwIfNoProjectAccess({
         session: ctx.session,
         projectId: input.projectId,
-        scope: "auditLogs:read",
+        scope: "projectAuditLogs:read",
       });
 
       const [auditLogs, totalCount] = await Promise.all([
@@ -195,7 +196,7 @@ export const auditLogsRouter = createTRPCRouter({
       throwIfNoOrganizationAccess({
         session: ctx.session,
         organizationId: input.orgId,
-        scope: "auditLogs:read",
+        scope: "orgAuditLogs:read",
       });
 
       // Fetch organization-level audit logs (where projectId is null)
@@ -257,7 +258,7 @@ export const auditLogsRouter = createTRPCRouter({
               in: apiKeyIds,
             },
             orgId: input.orgId,
-            scope: "ORGANIZATION",
+            scope: { in: orgBoundApiKeyScopes },
           },
           select: {
             id: true,

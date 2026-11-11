@@ -1,3 +1,4 @@
+import { testFeatureFlags } from "@/src/__tests__/fixtures/feature-flags";
 import type { Session } from "next-auth";
 import { prisma } from "@langfuse/shared/src/db";
 import { appRouter } from "@/src/server/api/root";
@@ -19,6 +20,9 @@ const session: Session = {
         role: "OWNER",
         plan: "cloud:hobby",
         cloudConfig: undefined,
+        metadata: {},
+        aiFeaturesEnabled: false,
+        aiTelemetryEnabled: true,
         projects: [
           {
             id: projectId,
@@ -26,20 +30,20 @@ const session: Session = {
             retentionDays: 30,
             deletedAt: null,
             name: "Test Project",
+            hasTraces: true,
+            metadata: {},
+            createdAt: new Date().toISOString(),
           },
         ],
       },
     ],
-    featureFlags: {
-      excludeClickhouseRead: false,
-      templateFlag: true,
-    },
-    admin: true,
+    featureFlags: testFeatureFlags(),
+    v4BetaEnabled: false,
   },
   environment: {} as any,
 };
 
-const ctx = createInnerTRPCContext({ session });
+const ctx = createInnerTRPCContext({ session, headers: {} });
 const caller = appRouter.createCaller({ ...ctx, prisma });
 
 describe("datasets.allDatasetsMetrics", () => {

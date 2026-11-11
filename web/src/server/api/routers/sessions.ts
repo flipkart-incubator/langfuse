@@ -1,7 +1,48 @@
 import { z } from "zod";
+import {
+  auditedQuery,
+  observationRefs,
+  scoreRefs,
+  ref,
+} from "@/src/features/audit-logs/server/auditedQuery";
 import { auditLog } from "@/src/features/audit-logs/auditLog";
 import { throwIfNoProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
-import { applyCommentFilters } from "@langfuse/shared/src/server";
+import {
+  applyCommentFilters,
+  logger,
+  getSessionsTable,
+  getSessionsTableCount,
+  getSessionsTableFromEvents,
+  getSessionsTableCountFromEvents,
+  getSessionMetricsFromEvents,
+  getSessionTracesFromEvents,
+  getObservationsForTraceFromEventsTable,
+  getObservationsWithModelDataFromEventsTable,
+  getObservationFullIOForSessionFromEventsTable,
+  getTracesGroupedByTags,
+  getTracesIdentifierForSession,
+  getScoresForTraces,
+  getCostForTraces,
+  getTracesGroupedByUsers,
+  getPublicSessionsFilter,
+  getSessionsWithMetrics,
+  hasAnySession,
+  getScoresForSessions,
+  getNumericScoresGroupedByName,
+  getBooleanScoresGroupedByName,
+  getCategoricalScoresGroupedByName,
+  tracesTableUiColumnDefinitions,
+  getEventsGroupedByUserId,
+  getEventsGroupedByTraceTags,
+  hasAnySessionFromEventsTable,
+  parseClickhouseUTCDateTimeFormat,
+  isStorableTraceSessionId,
+  storableTraceSessionIds,
+  getObservationsForSessionFromEventsTable,
+  MAX_OBSERVATIONS_PER_SESSION,
+  getScoresAndCorrectionsForTraces,
+  getAgentGraphDataFromEventsTable,
+} from "@langfuse/shared/src/server";
 import {
   createTRPCRouter,
   protectedGetSessionProcedure,
@@ -15,49 +56,36 @@ import {
   orderBy,
   paginationZod,
   type PrismaClient,
-  singleFilter,
+  singleFilterList,
   timeFilter,
   type SessionOptions,
   type ScoreDomain,
   LISTABLE_SCORE_TYPES,
+  sessionTraceFilterSchema,
+  ScoreDataTypeArray,
 } from "@langfuse/shared";
-import { Prisma } from "@langfuse/shared/src/db";
 import { TRPCError } from "@trpc/server";
 import Decimal from "decimal.js";
-import {
-  traceException,
-  getSessionsTable,
-  getSessionsTableCount,
-  getSessionsTableFromEvents,
-  getSessionsTableCountFromEvents,
-  getSessionMetricsFromEvents,
-  getSessionTracesFromEvents,
-  getObservationsWithModelDataFromEventsTable,
-  getTracesGroupedByTags,
-  getTracesIdentifierForSession,
-  getScoresForTraces,
-  getCostForTraces,
-  getTracesGroupedByUsers,
-  getPublicSessionsFilter,
-  logger,
-  getSessionsWithMetrics,
-  hasAnySession,
-  getScoresForSessions,
-  getNumericScoresGroupedByName,
-  getCategoricalScoresGroupedByName,
-  tracesTableUiColumnDefinitions,
-  getEventsGroupedByUserId,
-  getEventsGroupedByTraceTags,
-  hasAnySessionFromEventsTable,
-} from "@langfuse/shared/src/server";
 import chunk from "lodash/chunk";
 import { aggregateScores } from "@/src/features/scores/lib/aggregateScores";
-import { toDomainArrayWithStringifiedMetadata } from "@/src/utils/clientSideDomainTypes";
+import {
+  toDomainArrayWithStringifiedMetadata,
+  toDomainWithStringifiedMetadata,
+} from "@/src/utils/clientSideDomainTypes";
+import { type AgentGraphDataResponse } from "@/src/features/trace-graph-view/types";
+import { mapAgentGraphRecord } from "@/src/features/trace-graph-view/fns/mapAgentGraphRecord";
 
-const SessionFilterOptions = z.object({
+const storableSessionIdInput = z.string().refine(isStorableTraceSessionId, {
+  message:
+    "This session id contains a null character, which cannot be bookmarked or published.",
+});
+
+const SessionCountOptions = z.object({
   projectId: z.string(), // Required for protectedProjectProcedure
-  filter: z.array(singleFilter).nullable(),
+  filter: singleFilterList.nullable(),
   orderBy: orderBy,
+});
+const SessionFilterOptions = SessionCountOptions.extend({
   ...paginationZod,
 });
 
@@ -65,8 +93,28 @@ const SessionTraceObservationsInput = z.object({
   projectId: z.string(),
   sessionId: z.string(),
   traceId: z.string(),
-  filter: z.array(singleFilter).nullable(),
+  filter: singleFilterList.nullable(),
 });
+
+/**
+ * Bounded I/O contract for session-detail trace cards (LFE-10958). Cards are
+ * previews: every observation field whose full length fits the inline limit
+ * renders exactly as before; anything larger ships only a preview head plus
+ * its true length, and the trace peek / download are the full-reading
+ * surfaces. The inline limit matches the pretty view's client-side parse cap
+ * (deepParseJson maxSize) so under-cap cards are behavior-identical.
+ */
+const SESSION_OBSERVATION_INLINE_IO_CHAR_LIMIT = 300_000;
+const SESSION_OBSERVATION_PREVIEW_IO_CHAR_LIMIT = 4_000;
+/** Cards show at most this many observations; the peek shows the rest. */
+const SESSION_OBSERVATIONS_PER_TRACE_LIMIT = 50;
+/**
+ * Cumulative per-card I/O budget: once the summed returned I/O passes this,
+ * later observations collapse to preview heads even when each field is under
+ * the inline limit — many just-under-cap observations must not add up to an
+ * unbounded response.
+ */
+const SESSION_TRACE_TOTAL_IO_CHAR_BUDGET = 2_000_000;
 
 const handleGetSessionById = async (input: {
   sessionId: string;
@@ -75,12 +123,14 @@ const handleGetSessionById = async (input: {
     prisma: PrismaClient;
   };
 }) => {
-  const postgresSession = await input.ctx.prisma.traceSession.findFirst({
-    where: {
-      id: input.sessionId,
-      projectId: input.projectId,
-    },
-  });
+  const postgresSession = isStorableTraceSessionId(input.sessionId)
+    ? await input.ctx.prisma.traceSession.findFirst({
+        where: {
+          id: input.sessionId,
+          projectId: input.projectId,
+        },
+      })
+    : null;
 
   if (!postgresSession) {
     throw new TRPCError({
@@ -89,6 +139,7 @@ const handleGetSessionById = async (input: {
     });
   }
 
+  // eslint-disable-next-line @typescript-eslint/no-deprecated
   const clickhouseTraces = await getTracesIdentifierForSession(
     input.projectId,
     input.sessionId,
@@ -128,7 +179,8 @@ const handleGetSessionById = async (input: {
   const validatedScores = filterAndValidateDbScoreList({
     scores,
     dataTypes: LISTABLE_SCORE_TYPES,
-    onParseError: traceException,
+    onParseError: (error) =>
+      logger.warn("Invalid score omitted from response", { error }),
   });
 
   return {
@@ -200,7 +252,7 @@ export const sessionRouter = createTRPCRouter({
       const prismaSessionInfo = await ctx.prisma.traceSession.findMany({
         where: {
           id: {
-            in: sessions.map((s) => s.session_id),
+            in: storableTraceSessionIds(sessions.map((s) => s.session_id)),
           },
           projectId: input.projectId,
         },
@@ -230,9 +282,10 @@ export const sessionRouter = createTRPCRouter({
         }),
       };
     }),
-  allFromEvents: protectedProjectProcedure
-    .input(SessionFilterOptions)
-    .query(async ({ input, ctx }) => {
+  allFromEvents: auditedQuery(
+    protectedProjectProcedure.input(SessionFilterOptions),
+    { resourceType: "session", action: "list" },
+    async ({ input, ctx, audit }) => {
       const { filterState, hasNoMatches } = await applyCommentFilters({
         filterState: input.filter ?? [],
         prisma: ctx.prisma,
@@ -255,6 +308,14 @@ export const sessionRouter = createTRPCRouter({
       const sessions = await getSessionsTableFromEvents({
         projectId: input.projectId,
         filter: finalFilter,
+        fields: [
+          "session_id",
+          "user_ids",
+          "trace_count",
+          "trace_tags",
+          "min_timestamp",
+          "environment",
+        ],
         orderBy: normalizedOrderBy,
         page: input.page,
         limit: input.limit,
@@ -263,7 +324,7 @@ export const sessionRouter = createTRPCRouter({
       const prismaSessionInfo = await ctx.prisma.traceSession.findMany({
         where: {
           id: {
-            in: sessions.map((s) => s.session_id),
+            in: storableTraceSessionIds(sessions.map((s) => s.session_id)),
           },
           projectId: input.projectId,
         },
@@ -273,6 +334,8 @@ export const sessionRouter = createTRPCRouter({
           public: true,
         },
       });
+      audit.refs(sessions.map((s) => ref("session", s.session_id)));
+      audit.count(sessions.length);
       return {
         sessions: sessions.map((s) => {
           return {
@@ -291,9 +354,10 @@ export const sessionRouter = createTRPCRouter({
           };
         }),
       };
-    }),
+    },
+  ),
   countAll: protectedProjectProcedure
-    .input(SessionFilterOptions)
+    .input(SessionCountOptions)
     .query(async ({ input, ctx }) => {
       const { filterState, hasNoMatches } = await applyCommentFilters({
         filterState: input.filter ?? [],
@@ -327,7 +391,7 @@ export const sessionRouter = createTRPCRouter({
       };
     }),
   countAllFromEvents: protectedProjectProcedure
-    .input(SessionFilterOptions)
+    .input(SessionCountOptions)
     .query(async ({ input, ctx }) => {
       const { filterState, hasNoMatches } = await applyCommentFilters({
         filterState: input.filter ?? [],
@@ -385,7 +449,7 @@ export const sessionRouter = createTRPCRouter({
       const prismaSessionInfo = await ctx.prisma.traceSession.findMany({
         where: {
           id: {
-            in: sessions.map((s) => s.session_id),
+            in: storableTraceSessionIds(sessions.map((s) => s.session_id)),
           },
           projectId: input.projectId,
         },
@@ -399,14 +463,13 @@ export const sessionRouter = createTRPCRouter({
       const scores = await getScoresForSessions({
         projectId: ctx.session.projectId,
         sessionIds: sessions.map((s) => s.session_id),
-        limit: 1000,
-        offset: 0,
       });
 
       const validatedScores = filterAndValidateDbScoreList({
         scores,
         dataTypes: LISTABLE_SCORE_TYPES,
-        onParseError: traceException,
+        onParseError: (error) =>
+          logger.warn("Invalid score omitted from response", { error }),
       });
 
       return sessions.map((s) => ({
@@ -435,26 +498,43 @@ export const sessionRouter = createTRPCRouter({
         ),
       }));
     }),
-  metricsFromEvents: protectedProjectProcedure
-    .input(
+  metricsFromEvents: auditedQuery(
+    protectedProjectProcedure.input(
       z.object({
         projectId: z.string(),
         sessionIds: z.array(z.string()),
         queryFromTimestamp: z.date().nullish(),
       }),
-    )
-    .query(async ({ input, ctx }) => {
+    ),
+    { resourceType: "session", action: "list" },
+    async ({ input, ctx, audit }) => {
       if (input.sessionIds.length === 0) return [];
       const sessions = await getSessionMetricsFromEvents({
         projectId: input.projectId,
         sessionIds: input.sessionIds,
+        fields: [
+          "session_id",
+          "user_ids",
+          "trace_count",
+          "trace_tags",
+          "min_timestamp",
+          "environment",
+          "total_observations",
+          "duration",
+          "session_input_cost",
+          "session_output_cost",
+          "session_total_cost",
+          "session_input_usage",
+          "session_output_usage",
+          "session_total_usage",
+        ],
         queryFromTimestamp: input.queryFromTimestamp ?? undefined,
       });
 
       const prismaSessionInfo = await ctx.prisma.traceSession.findMany({
         where: {
           id: {
-            in: sessions.map((s) => s.session_id),
+            in: storableTraceSessionIds(sessions.map((s) => s.session_id)),
           },
           projectId: input.projectId,
         },
@@ -468,16 +548,17 @@ export const sessionRouter = createTRPCRouter({
       const scores = await getScoresForSessions({
         projectId: ctx.session.projectId,
         sessionIds: sessions.map((s) => s.session_id),
-        limit: 1000,
-        offset: 0,
       });
 
       const validatedScores = filterAndValidateDbScoreList({
         scores,
         dataTypes: LISTABLE_SCORE_TYPES,
-        onParseError: traceException,
+        onParseError: (error) =>
+          logger.warn("Invalid score omitted from response", { error }),
       });
 
+      audit.refs(sessions.map((s) => ref("session", s.session_id)));
+      audit.count(sessions.length);
       return sessions.map((s) => ({
         id: s.session_id,
         userIds: s.user_ids,
@@ -503,7 +584,8 @@ export const sessionRouter = createTRPCRouter({
           validatedScores.filter((score) => score.sessionId === s.session_id),
         ),
       }));
-    }),
+    },
+  ),
   filterOptions: protectedProjectProcedure
     .input(
       z.object({
@@ -542,27 +624,33 @@ export const sessionRouter = createTRPCRouter({
             }))
           : [];
 
-      const [userIds, tags, numericScoreNames, categoricalScoreNames] =
-        await Promise.all([
-          getTracesGroupedByUsers(
-            input.projectId,
-            filter,
-            undefined,
-            1000,
-            0,
-            columns,
-          ),
-          getTracesGroupedByTags({
-            projectId: input.projectId,
-            filter,
-            columns,
-          }),
-          getNumericScoresGroupedByName(input.projectId, scoreTimestampFilter),
-          getCategoricalScoresGroupedByName(
-            input.projectId,
-            scoreTimestampFilter,
-          ),
-        ]);
+      const [
+        userIds,
+        tags,
+        numericScoreNames,
+        categoricalScoreNames,
+        booleanScoreNames,
+      ] = await Promise.all([
+        getTracesGroupedByUsers(
+          input.projectId,
+          filter,
+          undefined,
+          1000,
+          0,
+          columns,
+        ),
+        getTracesGroupedByTags({
+          projectId: input.projectId,
+          filter,
+          columns,
+        }),
+        getNumericScoresGroupedByName(input.projectId, scoreTimestampFilter),
+        getCategoricalScoresGroupedByName(
+          input.projectId,
+          scoreTimestampFilter,
+        ),
+        getBooleanScoresGroupedByName(input.projectId, scoreTimestampFilter),
+      ]);
 
       return {
         userIds: userIds.map((row) => ({
@@ -573,6 +661,7 @@ export const sessionRouter = createTRPCRouter({
         tags: tags,
         scores_avg: numericScoreNames.map((s) => s.name),
         score_categories: categoricalScoreNames,
+        score_booleans: booleanScoreNames.map((s) => s.name),
       };
     }),
   filterOptionsFromEvents: protectedProjectProcedure
@@ -611,16 +700,22 @@ export const sessionRouter = createTRPCRouter({
             }))
           : [];
 
-      const [userIds, tags, numericScoreNames, categoricalScoreNames] =
-        await Promise.all([
-          getEventsGroupedByUserId(input.projectId, eventsFilter),
-          getEventsGroupedByTraceTags(input.projectId, eventsFilter),
-          getNumericScoresGroupedByName(input.projectId, scoreTimestampFilter),
-          getCategoricalScoresGroupedByName(
-            input.projectId,
-            scoreTimestampFilter,
-          ),
-        ]);
+      const [
+        userIds,
+        tags,
+        numericScoreNames,
+        categoricalScoreNames,
+        booleanScoreNames,
+      ] = await Promise.all([
+        getEventsGroupedByUserId(input.projectId, eventsFilter),
+        getEventsGroupedByTraceTags(input.projectId, eventsFilter),
+        getNumericScoresGroupedByName(input.projectId, scoreTimestampFilter),
+        getCategoricalScoresGroupedByName(
+          input.projectId,
+          scoreTimestampFilter,
+        ),
+        getBooleanScoresGroupedByName(input.projectId, scoreTimestampFilter),
+      ]);
 
       return {
         userIds: userIds.map((row) => ({
@@ -633,16 +728,18 @@ export const sessionRouter = createTRPCRouter({
         })),
         scores_avg: numericScoreNames.map((s) => s.name),
         score_categories: categoricalScoreNames,
+        score_booleans: booleanScoreNames.map((s) => s.name),
       };
     }),
-  byIdWithScores: protectedGetSessionProcedure
-    .input(
+  byIdWithScores: auditedQuery(
+    protectedGetSessionProcedure.input(
       z.object({
         sessionId: z.string(), // used for security check
         projectId: z.string(), // used for security check
       }),
-    )
-    .query(async ({ input, ctx }) => {
+    ),
+    { resourceType: "session", action: "read", idKey: "sessionId" },
+    async ({ input, ctx, audit }) => {
       const [scores, session] = await Promise.all([
         getScoresForSessions({
           projectId: input.projectId,
@@ -658,37 +755,93 @@ export const sessionRouter = createTRPCRouter({
       const validatedScores: ScoreDomain[] = filterAndValidateDbScoreList({
         scores,
         dataTypes: LISTABLE_SCORE_TYPES,
-        onParseError: traceException,
+        onParseError: (error) =>
+          logger.warn("Invalid score omitted from response", { error }),
       });
 
+      audit.refs([
+        ...session.traces.flatMap((trace) => [
+          ref("trace", trace.id),
+          ...scoreRefs(trace.scores),
+        ]),
+        ...scoreRefs(validatedScores),
+      ]);
+      audit.count(session.traces.length);
       return {
         ...session,
         scores: toDomainArrayWithStringifiedMetadata(validatedScores),
       };
-    }),
-  byIdWithScoresFromEvents: protectedGetSessionProcedure
-    .input(
+    },
+  ),
+  previewTree: auditedQuery(
+    protectedGetSessionProcedure.input(
+      z.object({
+        projectId: z.string(),
+        sessionId: z.string(),
+      }),
+    ),
+    { resourceType: "trace", action: "list" },
+    async ({ input, audit }) => {
+      audit.refs([ref("session", input.sessionId)]);
+      const traces = await getSessionTracesFromEvents({
+        ...input,
+        filter: [],
+        limit: 5,
+      });
+      if (traces.length === 0) return [];
+      const previews = await Promise.all(
+        traces.map(async (trace) => {
+          const source = {
+            projectId: input.projectId,
+            traceId: trace.id,
+            timestamp: trace.timestamp,
+          };
+          const structure = await getObservationsForTraceFromEventsTable({
+            ...source,
+            limit: 200,
+            selectMetadata: true,
+          });
+          return {
+            id: trace.id,
+            name: trace.name,
+            truncated: structure.totalCount > structure.observations.length,
+            observations: structure.observations.map((observation) => ({
+              id: observation.id,
+              parentObservationId: observation.parentObservationId,
+              name: observation.name,
+              type: observation.type,
+              level: observation.level,
+              isRootObservation: observation.isRootObservation,
+              userId: observation.userId,
+              environment: observation.environment,
+              traceTags: observation.traceTags,
+              metadata: observation.metadata,
+            })),
+          };
+        }),
+      );
+      audit.refs(
+        previews.flatMap((trace) => [
+          ref("trace", trace.id),
+          ...trace.observations.map((observation) =>
+            ref("observation", observation.id),
+          ),
+        ]),
+      );
+      audit.count(previews.length);
+      return previews;
+    },
+  ),
+  byIdWithScoresFromEvents: auditedQuery(
+    protectedGetSessionProcedure.input(
       z.object({
         sessionId: z.string(), // used for security check
         projectId: z.string(), // used for security check
       }),
-    )
-    .query(async ({ input, ctx }) => {
-      const postgresSession = await ctx.prisma.traceSession.findFirst({
-        where: {
-          id: input.sessionId,
-          projectId: input.projectId,
-        },
-      });
-
-      if (!postgresSession) {
-        throw new TRPCError({
-          code: "NOT_FOUND",
-          message: "Session not found in project",
-        });
-      }
-
-      const [scores, sessionMetrics] = await Promise.all([
+    ),
+    { resourceType: "session", action: "read", idKey: "sessionId" },
+    async ({ input, ctx, audit }) => {
+      const [scores, sessionMetrics, postgresSession] = await Promise.all([
         getScoresForSessions({
           projectId: input.projectId,
           sessionIds: [input.sessionId],
@@ -696,17 +849,52 @@ export const sessionRouter = createTRPCRouter({
         getSessionMetricsFromEvents({
           projectId: input.projectId,
           sessionIds: [input.sessionId],
+          fields: [
+            "user_ids",
+            "trace_count",
+            "session_total_cost",
+            "session_input_usage",
+            "session_output_usage",
+            "session_total_usage",
+            "min_timestamp",
+            "max_timestamp",
+            "environment",
+          ],
         }).then((rows) => rows[0]),
+        isStorableTraceSessionId(input.sessionId)
+          ? ctx.prisma.traceSession.findFirst({
+              where: {
+                id: input.sessionId,
+                projectId: input.projectId,
+              },
+              select: {
+                bookmarked: true,
+                public: true,
+              },
+            })
+          : null,
       ]);
+
+      if (!sessionMetrics) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Session not found in project",
+        });
+      }
 
       const validatedScores: ScoreDomain[] = filterAndValidateDbScoreList({
         scores,
         dataTypes: LISTABLE_SCORE_TYPES,
-        onParseError: traceException,
+        onParseError: (error) =>
+          logger.warn("Invalid score omitted from response", { error }),
       });
 
+      audit.refs(scoreRefs(validatedScores));
       return {
-        ...postgresSession,
+        id: input.sessionId,
+        projectId: input.projectId,
+        bookmarked: postgresSession?.bookmarked ?? false,
+        public: postgresSession?.public ?? false,
         users:
           sessionMetrics?.user_ids?.filter(
             (userId) => userId !== null && userId !== "",
@@ -715,21 +903,34 @@ export const sessionRouter = createTRPCRouter({
         totalCost: sessionMetrics
           ? Number(sessionMetrics.session_total_cost)
           : 0,
+        inputUsage: Number(sessionMetrics.session_input_usage),
+        outputUsage: Number(sessionMetrics.session_output_usage),
+        totalTokens: Number(sessionMetrics.session_total_usage),
+        minTimestamp: parseClickhouseUTCDateTimeFormat(
+          sessionMetrics.min_timestamp,
+        ),
+        maxTimestamp: parseClickhouseUTCDateTimeFormat(
+          sessionMetrics.max_timestamp,
+        ),
         environment: sessionMetrics?.environment,
         scores: toDomainArrayWithStringifiedMetadata(validatedScores),
       };
-    }),
-  tracesFromEvents: protectedGetSessionProcedure
-    .input(
+    },
+  ),
+  tracesFromEvents: auditedQuery(
+    protectedGetSessionProcedure.input(
       z.object({
         sessionId: z.string(), // used for security check
         projectId: z.string(), // used for security check
+        filter: sessionTraceFilterSchema.optional(),
       }),
-    )
-    .query(async ({ input }) => {
+    ),
+    { resourceType: "trace", action: "list" },
+    async ({ input, audit }) => {
       const traces = await getSessionTracesFromEvents({
         projectId: input.projectId,
         sessionId: input.sessionId,
+        filter: input.filter ?? [],
       });
 
       const chunks = chunk(traces, 500);
@@ -748,19 +949,120 @@ export const sessionRouter = createTRPCRouter({
       const validatedScores = filterAndValidateDbScoreList({
         scores,
         dataTypes: LISTABLE_SCORE_TYPES,
-        onParseError: traceException,
+        onParseError: (error) =>
+          logger.warn("Invalid score omitted from response", { error }),
       });
 
+      audit.refs([
+        ref("session", input.sessionId),
+        ...traces.map((trace) => ref("trace", trace.id)),
+        ...scoreRefs(validatedScores),
+      ]);
+      audit.count(traces.length);
       return traces.map((trace) => ({
         ...trace,
         scores: toDomainArrayWithStringifiedMetadata(
           validatedScores.filter((s) => s.traceId === trace.id),
         ),
       }));
-    }),
-  observationsForTraceFromEvents: protectedGetSessionProcedure
-    .input(SessionTraceObservationsInput)
-    .query(async ({ input }) => {
+    },
+  ),
+  agentGraphDataForSessionFromEvents: auditedQuery(
+    protectedGetSessionProcedure.input(
+      z.object({
+        projectId: z.string(),
+        sessionId: z.string().min(1),
+        minStartTime: z.iso.datetime({ offset: true }),
+        maxStartTime: z.iso.datetime({ offset: true }),
+      }),
+    ),
+    { resourceType: "session", action: "read", idKey: "sessionId" },
+    async ({
+      input,
+      audit,
+    }): Promise<(AgentGraphDataResponse & { traceId: string })[]> => {
+      const records = await getAgentGraphDataFromEventsTable({
+        projectId: input.projectId,
+        sessionId: input.sessionId,
+        minStartTime: new Date(input.minStartTime),
+        maxStartTime: new Date(input.maxStartTime),
+      });
+      const result = records.flatMap((record) => {
+        const mapped = mapAgentGraphRecord(record);
+        if (!mapped?.traceId) return [];
+        return [{ ...mapped, traceId: mapped.traceId }];
+      });
+      audit.refs(result.map((node) => ref("observation", node.id)));
+      audit.count(result.length);
+      return result;
+    },
+  ),
+  observationsForSessionFromEvents: auditedQuery(
+    protectedGetSessionProcedure.input(
+      z.object({ projectId: z.string(), sessionId: z.string().min(1) }),
+    ),
+    { resourceType: "session", action: "read", idKey: "sessionId" },
+    async ({ input, audit }) => {
+      const { observations, totalCount } =
+        await getObservationsForSessionFromEventsTable(input);
+      const traceStartTimes = new Map<string, number>();
+      for (const observation of observations) {
+        if (!observation.traceId) continue;
+        const startTime = observation.startTime.getTime();
+        traceStartTimes.set(
+          observation.traceId,
+          Math.min(
+            traceStartTimes.get(observation.traceId) ?? startTime,
+            startTime,
+          ),
+        );
+      }
+      const traceIds = [...traceStartTimes.keys()];
+      const scores: Awaited<
+        ReturnType<typeof getScoresAndCorrectionsForTraces>
+      > = [];
+      // Bound concurrent score reads even for sessions containing many traces.
+      for (const batch of chunk(chunk(traceIds, 500), 4)) {
+        const results = await Promise.all(
+          batch.map((ids) =>
+            getScoresAndCorrectionsForTraces({
+              projectId: input.projectId,
+              traceIds: ids,
+              timestamp: new Date(
+                Math.min(...ids.map((id) => traceStartTimes.get(id)!)),
+              ),
+            }),
+          ),
+        );
+        scores.push(...results.flat());
+      }
+      const validatedScores = filterAndValidateDbScoreList({
+        scores,
+        dataTypes: ScoreDataTypeArray,
+        onParseError: (error) =>
+          logger.warn("Invalid score omitted from response", { error }),
+      });
+      audit.refs([
+        ...observationRefs(observations),
+        ...scoreRefs(validatedScores),
+      ]);
+      audit.count(observations.length);
+      return {
+        observations: toDomainArrayWithStringifiedMetadata(observations),
+        scores: toDomainArrayWithStringifiedMetadata(
+          validatedScores.filter((s) => s.dataType !== "CORRECTION"),
+        ),
+        corrections: validatedScores.filter((s) => s.dataType === "CORRECTION"),
+        cutoffObservationsAfterMaxCount:
+          totalCount > MAX_OBSERVATIONS_PER_SESSION,
+        maxObservationsPerSession: MAX_OBSERVATIONS_PER_SESSION,
+      };
+    },
+  ),
+  observationsForTraceFromEvents: auditedQuery(
+    protectedGetSessionProcedure.input(SessionTraceObservationsInput),
+    { resourceType: "trace", action: "read", idKey: "traceId" },
+    async ({ input, audit }) => {
       const positionFilter = (input.filter ?? []).find(
         (filter) => filter.type === "positionInTrace",
       );
@@ -785,7 +1087,11 @@ export const sessionRouter = createTRPCRouter({
       ];
 
       let orderBy: OrderByState = { column: "startTime", order: "ASC" };
-      let limit: number | undefined;
+      // One extra row is returned as the "more observations exist" sentinel
+      // (the client shows the first LIMIT and surfaces a notice when it sees
+      // the +1), and one more because the synthetic trace-level row (id
+      // `t-<traceId>`) may sit in the fetched window without consuming a slot.
+      let limit: number = SESSION_OBSERVATIONS_PER_TRACE_LIMIT + 2;
       let offset: number | undefined;
 
       if (positionFilter) {
@@ -803,7 +1109,10 @@ export const sessionRouter = createTRPCRouter({
         limit = 1;
       }
 
-      const observations = await getObservationsWithModelDataFromEventsTable({
+      // No renderingProps: ioSizeCap owns the I/O select, and this path's
+      // conversion always returns I/O as raw strings (the V1 enricher
+      // hardcodes parseIoAsJson=false) — the client parses.
+      const fetched = await getObservationsWithModelDataFromEventsTable({
         projectId: input.projectId,
         filter: filterState,
         searchQuery: undefined,
@@ -812,69 +1121,197 @@ export const sessionRouter = createTRPCRouter({
         limit,
         offset,
         selectIOAndMetadata: true,
-        renderingProps: { truncated: false, shouldJsonParse: true },
+        ioSizeCap: {
+          inlineChars: SESSION_OBSERVATION_INLINE_IO_CHAR_LIMIT,
+          previewChars: SESSION_OBSERVATION_PREVIEW_IO_CHAR_LIMIT,
+        },
+        // Un-merged ReplacingMergeTree row versions of one span must not
+        // count as separate observations: the 50-row page, the hasMore
+        // detection, and the budget below all count rows.
+        dedupeBySpanId: true,
       });
 
-      return observations;
-    }),
+      // The synthetic trace-level row is metadata about the trace, not one of
+      // its observations: it must neither consume one of the card's slots
+      // (displacing a real observation) nor count toward the "more exist"
+      // signal. The client decides whether to show or drop it (redundancy
+      // dedupe).
+      //
+      // BACKWARD-COMPATIBLE RESPONSE SHAPE (LFE-10958 regression): this
+      // procedure returns a BARE ARRAY of observations. The client consumes
+      // the response as an array and calls `.find`/`.filter` on it directly,
+      // so wrapping it in an `{ observations, ... }` envelope crashes in-flight
+      // old clients during a rollout ("x.find is not a function"). "More
+      // observations exist" is therefore signalled IN-BAND: we return up to
+      // SESSION_OBSERVATIONS_PER_TRACE_LIMIT + 1 real observations, and the
+      // client treats that extra (+1) row as the "has more" sentinel, showing
+      // only the first LIMIT. (With a positionFilter the fetch limit is 1, so
+      // at most one row is returned and the sentinel can never appear.)
+      const syntheticTraceRowId = `t-${input.traceId}`;
+      let realTaken = 0;
+      const page: typeof fetched = [];
+      for (const observation of fetched) {
+        if (observation.id === syntheticTraceRowId) {
+          page.push(observation);
+          continue;
+        }
+        // Keep one past the display limit as the "more exist" sentinel.
+        if (realTaken >= SESSION_OBSERVATIONS_PER_TRACE_LIMIT + 1) continue;
+        page.push(observation);
+        realTaken++;
+      }
+
+      // Preview head of a value regardless of parse state: I/O is a raw
+      // string on this path, but if conversion ever starts returning parsed
+      // objects the budget must keep holding — hence the stringify branch.
+      // The cut is surrogate-safe: plain .slice can split an astral-plane
+      // character (emoji/CJK) and leave a corrupted lone surrogate — the SQL
+      // side avoids this via leftUTF8, so the JS fallback must too.
+      const toPreviewHead = (value: unknown): unknown => {
+        const text =
+          typeof value === "string" ? value : (JSON.stringify(value) ?? "");
+        if (text.length <= SESSION_OBSERVATION_PREVIEW_IO_CHAR_LIMIT)
+          return value;
+        const head = text.slice(0, SESSION_OBSERVATION_PREVIEW_IO_CHAR_LIMIT);
+        const lastCode = head.charCodeAt(head.length - 1);
+        return lastCode >= 0xd800 && lastCode <= 0xdbff
+          ? head.slice(0, -1)
+          : head;
+      };
+
+      // Cumulative budget: rows are order-stable (startTime ASC + span-dedup),
+      // so the trim is deterministic. The check runs before adding the row's
+      // own size, so the first observation always keeps whatever the per-field
+      // cap allowed. Sizes come from the server-computed lengths + flags —
+      // including the shipped metadata weight — NOT from the returned values,
+      // so the accounting is independent of value shape.
+      let cumulativeIOChars = 0;
+      const observations = page.map((observation) => {
+        const returnedIOChars =
+          (observation.inputTruncated
+            ? SESSION_OBSERVATION_PREVIEW_IO_CHAR_LIMIT
+            : observation.inputLength) +
+          (observation.outputTruncated
+            ? SESSION_OBSERVATION_PREVIEW_IO_CHAR_LIMIT
+            : observation.outputLength) +
+          observation.metadataLength;
+        const withinBudget =
+          cumulativeIOChars <= SESSION_TRACE_TOTAL_IO_CHAR_BUDGET;
+        cumulativeIOChars += returnedIOChars;
+        if (withinBudget) return observation;
+
+        const input = toPreviewHead(observation.input);
+        const output = toPreviewHead(observation.output);
+        return {
+          ...observation,
+          input,
+          output,
+          // Past the budget, metadata is dropped rather than shipped — the
+          // flag routes readers to the trace view for the full values.
+          metadata: {},
+          metadataTruncated:
+            observation.metadataTruncated || observation.metadataLength > 0,
+          inputTruncated:
+            observation.inputTruncated || input !== observation.input,
+          outputTruncated:
+            observation.outputTruncated || output !== observation.output,
+        };
+      });
+
+      audit.refs([
+        ref("session", input.sessionId),
+        ...observationRefs(observations),
+      ]);
+      audit.count(observations.length);
+      return toDomainArrayWithStringifiedMetadata(observations);
+    },
+  ),
+  /**
+   * Full raw I/O for one observation, for the session card's download
+   * fallback (LFE-10958). Session-authorized (public sessions included); the
+   * repository query scopes by sessionId so a session grant cannot read
+   * observations outside that session. Returns raw strings — the client
+   * saves them to a file and never renders them.
+   */
+  observationFullIOFromEvents: auditedQuery(
+    protectedGetSessionProcedure.input(
+      z.object({
+        projectId: z.string(),
+        sessionId: z.string(),
+        traceId: z.string(),
+        observationId: z.string(),
+        startTime: z.date(),
+      }),
+    ),
+    { resourceType: "observation", action: "read", idKey: "observationId" },
+    async ({ input, audit }) => {
+      const observation = await getObservationFullIOForSessionFromEventsTable({
+        projectId: input.projectId,
+        sessionId: input.sessionId,
+        traceId: input.traceId,
+        observationId: input.observationId,
+        startTime: input.startTime,
+      });
+
+      if (!observation) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Observation not found in session",
+        });
+      }
+
+      audit.refs([
+        ref("trace", input.traceId),
+        ref("session", input.sessionId),
+      ]);
+      return toDomainWithStringifiedMetadata(observation);
+    },
+  ),
   bookmark: protectedProjectProcedure
     .input(
       z.object({
-        sessionId: z.string(),
+        sessionId: storableSessionIdInput,
         projectId: z.string(),
         bookmarked: z.boolean(),
       }),
     )
     .mutation(async ({ input, ctx }) => {
-      try {
-        throwIfNoProjectAccess({
-          session: ctx.session,
+      throwIfNoProjectAccess({
+        session: ctx.session,
+        projectId: input.projectId,
+        scope: "objects:bookmark",
+      });
+
+      await auditLog({
+        session: ctx.session,
+        resourceType: "session",
+        resourceId: input.sessionId,
+        action: "bookmark",
+        after: input.bookmarked,
+      });
+
+      return ctx.prisma.traceSession.upsert({
+        where: {
+          id_projectId: {
+            id: input.sessionId,
+            projectId: input.projectId,
+          },
+        },
+        create: {
+          id: input.sessionId,
           projectId: input.projectId,
-          scope: "objects:bookmark",
-        });
-
-        await auditLog({
-          session: ctx.session,
-          resourceType: "session",
-          resourceId: input.sessionId,
-          action: "bookmark",
-          after: input.bookmarked,
-        });
-
-        const session = await ctx.prisma.traceSession.update({
-          where: {
-            id_projectId: {
-              id: input.sessionId,
-              projectId: input.projectId,
-            },
-          },
-          data: {
-            bookmarked: input.bookmarked,
-          },
-        });
-        return session;
-      } catch (error) {
-        logger.error("Unable to call sessions.bookmark", error);
-        if (
-          error instanceof Prisma.PrismaClientKnownRequestError &&
-          error.code === "P2025" // Record to update not found
-        )
-          throw new TRPCError({
-            code: "NOT_FOUND",
-            message: "Session not found in project",
-          });
-        else {
-          throw new TRPCError({
-            code: "INTERNAL_SERVER_ERROR",
-          });
-        }
-      }
+          bookmarked: input.bookmarked,
+        },
+        update: {
+          bookmarked: input.bookmarked,
+        },
+      });
     }),
   publish: protectedProjectProcedure
     .input(
       z.object({
         projectId: z.string(),
-        sessionId: z.string(),
+        sessionId: storableSessionIdInput.min(1),
         public: z.boolean(),
       }),
     )
@@ -891,14 +1328,19 @@ export const sessionRouter = createTRPCRouter({
         action: "publish",
         after: input.public,
       });
-      return ctx.prisma.traceSession.update({
+      return ctx.prisma.traceSession.upsert({
         where: {
           id_projectId: {
             id: input.sessionId,
             projectId: input.projectId,
           },
         },
-        data: {
+        create: {
+          id: input.sessionId,
+          projectId: input.projectId,
+          public: input.public,
+        },
+        update: {
           public: input.public,
         },
       });

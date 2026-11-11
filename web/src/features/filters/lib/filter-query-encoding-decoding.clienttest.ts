@@ -1,8 +1,10 @@
+// @vitest-environment node
+
 import {
   encodeFiltersGeneric,
   decodeFiltersGeneric,
-} from "@/src/features/filters/lib/filter-query-encoding";
-import type { FilterState } from "@langfuse/shared";
+  type FilterState,
+} from "@langfuse/shared";
 
 // Wrapper functions for tests
 const encodeFilters = (filters: FilterState) => encodeFiltersGeneric(filters);
@@ -161,6 +163,21 @@ describe("Filter Query Encoding & Decoding (Legacy Format)", () => {
       ];
       expect(encodeFilters(filters)).toBe(
         "scoresNumeric;numberObject;accuracy;>=;0.8",
+      );
+    });
+
+    it("should encode booleanObject filter", () => {
+      const filters: FilterState = [
+        {
+          column: "score_booleans",
+          type: "booleanObject",
+          operator: "=",
+          key: "flag",
+          value: true,
+        },
+      ];
+      expect(encodeFilters(filters)).toBe(
+        "score_booleans;booleanObject;flag;=;true",
       );
     });
 
@@ -356,6 +373,20 @@ describe("Filter Query Encoding & Decoding (Legacy Format)", () => {
       ]);
     });
 
+    it("should decode booleanObject filter", () => {
+      const query = "score_booleans;booleanObject;flag;=;true";
+      const decoded = decodeFilters(query);
+      expect(decoded).toEqual([
+        {
+          column: "score_booleans",
+          type: "booleanObject",
+          operator: "=",
+          key: "flag",
+          value: true,
+        },
+      ]);
+    });
+
     it("should decode stringObject filter", () => {
       const query = "metadata;stringObject;environment;contains;production";
       const decoded = decodeFilters(query);
@@ -437,6 +468,18 @@ describe("Filter Query Encoding & Decoding (Legacy Format)", () => {
   });
 
   describe("Round-trip consistency", () => {
+    it.each([
+      { value: [""] },
+      { value: ["\\e"] },
+      { value: ["\\\\e"] },
+      { value: ["", "\\e", "a|b"] },
+    ])("preserves empty strings and escaped values ($value)", ({ value }) => {
+      const filters: FilterState = [
+        { column: "name", type: "stringOptions", operator: "any of", value },
+      ];
+      expect(decodeFilters(encodeFilters(filters))).toEqual(filters);
+    });
+
     it("should maintain consistency through encode -> decode", () => {
       const originalFilters: FilterState = [
         {
@@ -526,6 +569,24 @@ describe("Filter Query Encoding & Decoding (Legacy Format)", () => {
       expect(deserialized).toEqual(filterWithPendingNoneSelection);
     });
 
+    it.each(["key;name", "key,name", "key%", "%41", "deployment region"])(
+      "round-trips object key %s",
+      (key) => {
+        const filters: FilterState = [
+          {
+            column: "metadata",
+            type: "stringObject",
+            key,
+            operator: "=",
+            value: "value",
+          },
+          { column: "name", type: "string", operator: "=", value: "next" },
+        ];
+
+        expect(decodeFilters(encodeFilters(filters))).toEqual(filters);
+      },
+    );
+
     it("should maintain consistency for values containing pipes", () => {
       // Issue #11757: values with literal | should round-trip correctly
       const cases: FilterState[] = [
@@ -612,6 +673,39 @@ describe("Filter Query Encoding & Decoding (Legacy Format)", () => {
       const deserialized = decodeFilters(serialized);
 
       expect(deserialized).toEqual(mixedFilters);
+    });
+
+    it("round-trips an optional target as a sixth field without changing untargeted URLs", () => {
+      const untargeted: FilterState = [
+        {
+          column: "level",
+          type: "stringOptions",
+          operator: "any of",
+          value: ["ERROR"],
+        },
+      ];
+      expect(encodeFilters(untargeted)).toBe(
+        "level;stringOptions;;any of;ERROR",
+      );
+      expect(decodeFilters("level;stringOptions;;any of;ERROR")).toEqual(
+        untargeted,
+      );
+
+      const targeted: FilterState = [
+        {
+          column: "level",
+          type: "stringOptions",
+          operator: "any of",
+          value: ["ERROR"],
+          target: "run-b",
+        },
+      ];
+      expect(encodeFilters(targeted)).toBe(
+        "level;stringOptions;;any of;ERROR;run-b",
+      );
+      expect(decodeFilters("level;stringOptions;;any of;ERROR;run-b")).toEqual(
+        targeted,
+      );
     });
   });
 });

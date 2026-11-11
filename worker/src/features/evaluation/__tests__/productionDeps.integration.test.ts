@@ -5,6 +5,7 @@ import {
   createOrgProjectAndApiKey,
   StorageService,
   StorageServiceFactory,
+  storageKeys,
 } from "@langfuse/shared/src/server";
 import { prisma } from "@langfuse/shared/src/db";
 import { EvalTargetObject } from "@langfuse/shared";
@@ -36,8 +37,7 @@ describe("Production Dependency Factories Integration Tests", () => {
   beforeAll(async () => {
     // Initialize S3 client for verification and cleanup
     s3StorageService = StorageServiceFactory.getInstance({
-      accessKeyId: minioAccessKeyId,
-      secretAccessKey: minioAccessKeySecret,
+      credentials: storageKeys(minioAccessKeyId, minioAccessKeySecret),
       bucketName,
       endpoint: minioEndpoint,
       region: "auto",
@@ -171,10 +171,11 @@ describe("Production Dependency Factories Integration Tests", () => {
       it("should upload observation data to S3 and return the path", async () => {
         const { projectId } = await createOrgProjectAndApiKey();
         const observationId = randomUUID();
+        const traceId = randomUUID();
 
         const observationData = {
           id: observationId,
-          traceId: randomUUID(),
+          traceId,
           projectId,
           type: "GENERATION",
           input: { prompt: "Hello" },
@@ -186,6 +187,7 @@ describe("Production Dependency Factories Integration Tests", () => {
         // Execute
         const s3Path = await deps.uploadObservationToS3({
           projectId,
+          traceId,
           observationId,
           data: observationData,
         });
@@ -196,7 +198,7 @@ describe("Production Dependency Factories Integration Tests", () => {
         // Verify path format (uses env prefix, defaults to "")
         const prefix = env.LANGFUSE_S3_EVENT_UPLOAD_PREFIX || "";
         expect(s3Path).toBe(
-          `${prefix}evals/${projectId}/observations/${observationId}.json`,
+          `${prefix}evals/${projectId}/traces/${traceId}/observations/${observationId}.json`,
         );
 
         // Verify file exists in S3 by checking it was created with the correct path
@@ -396,6 +398,7 @@ describe("Production Dependency Factories Integration Tests", () => {
 
       const s3Path = await schedulerDeps.uploadObservationToS3({
         projectId,
+        traceId,
         observationId,
         data: observationData,
       });
